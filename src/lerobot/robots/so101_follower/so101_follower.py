@@ -82,15 +82,25 @@ class SO101Follower(Robot):
     def is_connected(self) -> bool:
         return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
 
-    def connect(self, calibrate: bool = True) -> None:
+    def connect(self, calibrate: bool = True, skip_firmware_check: bool = False) -> None:
         """
         We assume that at connection time, arm is in a rest position,
         and torque can be safely disabled to run calibration.
+        
+        Args:
+            calibrate: Whether to calibrate the robot after connecting if needed.
+            skip_firmware_check: Whether to bypass firmware version validation (use with caution).
         """
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
-        self.bus.connect()
+        if skip_firmware_check:
+            # Connect bypassing firmware check
+            self.bus._connect(handshake=False)
+            self.bus._assert_motors_exist()
+        else:
+            self.bus.connect()
+            
         if not self.is_calibrated and calibrate:
             logger.info(
                 "Mismatch between calibration values in the motor and the calibration file or no calibration file found"

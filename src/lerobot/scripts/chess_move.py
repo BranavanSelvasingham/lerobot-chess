@@ -26,6 +26,7 @@ class MoveConfig:
     to_square: str = "e4"
     hover_height_m: float = 0.08
     transit_height_m: float = 0.15
+    skip_calibration: bool = False
 
 
 def _parse_args() -> MoveConfig:
@@ -36,6 +37,7 @@ def _parse_args() -> MoveConfig:
     p.add_argument("--to", dest="to_square", default="e4")
     p.add_argument("--hover_height_m", type=float, default=0.08)
     p.add_argument("--transit_height_m", type=float, default=0.15)
+    p.add_argument("--skip-calibration", action="store_true", help="Skip robot calibration")
     a = p.parse_args()
     return MoveConfig(
         port=a.port,
@@ -44,6 +46,7 @@ def _parse_args() -> MoveConfig:
         to_square=a.to_square,
         hover_height_m=a.hover_height_m,
         transit_height_m=a.transit_height_m,
+        skip_calibration=getattr(a, 'skip_calibration', False),
     )
 
 
@@ -52,7 +55,7 @@ def main(cfg: MoveConfig | None = None) -> None:
         cfg = _parse_args()
     robot_cfg = SO101FollowerConfig(port=cfg.port, id="so101_chess", cameras={}, use_degrees=True)
     robot = SO101Follower(robot_cfg)
-    robot.connect(calibrate=True)
+    robot.connect(calibrate=not cfg.skip_calibration, skip_firmware_check=True)
 
     # Load kinematics
     kin = RobotKinematics(

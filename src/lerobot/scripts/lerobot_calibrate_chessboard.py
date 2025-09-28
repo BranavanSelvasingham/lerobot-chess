@@ -34,7 +34,7 @@ def main(cfg: CalibrateBoardConfig | None = None) -> None:
         cfg = _parse_args()
     robot_cfg = SO101FollowerConfig(port=cfg.port, id="so101_chess", cameras={}, use_degrees=True)
     robot = SO101Follower(robot_cfg)
-    robot.connect(calibrate=True)
+    robot.connect(calibrate=True, skip_firmware_check=True)
 
     # Capture one frame from any connected camera; here we expect an arm-mounted camera to exist in config
     if not robot.cameras:
