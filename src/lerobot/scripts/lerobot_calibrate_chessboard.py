@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-import draccus
+import argparse
 import numpy as np
 
 from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig
@@ -22,7 +21,17 @@ class CalibrateBoardConfig:
     square_size_mm: float = 50.0
 
 
-def main(cfg: CalibrateBoardConfig = draccus.run(CalibrateBoardConfig)) -> None:
+def _parse_args() -> CalibrateBoardConfig:
+    p = argparse.ArgumentParser(description="Estimate chessboard model and save to calibration dir")
+    p.add_argument("--port", required=True)
+    p.add_argument("--square_size_mm", type=float, default=50.0)
+    a = p.parse_args()
+    return CalibrateBoardConfig(port=a.port, square_size_mm=a.square_size_mm)
+
+
+def main(cfg: CalibrateBoardConfig | None = None) -> None:
+    if cfg is None:
+        cfg = _parse_args()
     robot_cfg = SO101FollowerConfig(port=cfg.port, id="so101_chess", cameras={}, use_degrees=True)
     robot = SO101Follower(robot_cfg)
     robot.connect(calibrate=True)

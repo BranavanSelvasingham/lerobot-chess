@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-
-import draccus
+import argparse
 import numpy as np
 
 from lerobot.robots.so101_follower.config_so101_follower import SO101FollowerConfig
@@ -20,7 +19,21 @@ class HomeConfig:
     go: bool = True
 
 
-def main(cfg: HomeConfig = draccus.run(HomeConfig)) -> None:
+def _parse_args() -> HomeConfig:
+    p = argparse.ArgumentParser(description="Save or go to a home joint pose")
+    p.add_argument("--port", required=True)
+    p.add_argument("--save", action="store_true")
+    p.add_argument("--go", action="store_true")
+    a = p.parse_args()
+    # Default to go if neither flag set
+    if not a.save and not a.go:
+        a.go = True
+    return HomeConfig(port=a.port, save=a.save, go=a.go)
+
+
+def main(cfg: HomeConfig | None = None) -> None:
+    if cfg is None:
+        cfg = _parse_args()
     robot_cfg = SO101FollowerConfig(port=cfg.port, id="so101_chess", cameras={}, use_degrees=True)
     robot = SO101Follower(robot_cfg)
     robot.connect(calibrate=True)

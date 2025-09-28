@@ -5,8 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from typing import Optional
-
-import draccus
+import argparse
 import numpy as np
 
 from lerobot.model.kinematics import RobotKinematics
@@ -29,7 +28,28 @@ class MoveConfig:
     transit_height_m: float = 0.15
 
 
-def main(cfg: MoveConfig = draccus.run(MoveConfig)) -> None:
+def _parse_args() -> MoveConfig:
+    p = argparse.ArgumentParser(description="Execute a single chess move with SO-101")
+    p.add_argument("--port", required=True, help="Serial port for SO-101, e.g. /dev/tty.usbmodemXXXX")
+    p.add_argument("--urdf_path", default="./SO101/so101_new_calib.urdf")
+    p.add_argument("--from", dest="from_square", default="e2")
+    p.add_argument("--to", dest="to_square", default="e4")
+    p.add_argument("--hover_height_m", type=float, default=0.08)
+    p.add_argument("--transit_height_m", type=float, default=0.15)
+    a = p.parse_args()
+    return MoveConfig(
+        port=a.port,
+        urdf_path=a.urdf_path,
+        from_square=a.from_square,
+        to_square=a.to_square,
+        hover_height_m=a.hover_height_m,
+        transit_height_m=a.transit_height_m,
+    )
+
+
+def main(cfg: MoveConfig | None = None) -> None:
+    if cfg is None:
+        cfg = _parse_args()
     robot_cfg = SO101FollowerConfig(port=cfg.port, id="so101_chess", cameras={}, use_degrees=True)
     robot = SO101Follower(robot_cfg)
     robot.connect(calibrate=True)
