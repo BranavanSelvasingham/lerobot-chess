@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-
-import draccus
+import argparse
 
 try:
     import chess
@@ -20,7 +19,16 @@ class PlayConfig:
     engine: str | None = None  # placeholder; user can integrate engine later
 
 
-def main(cfg: PlayConfig = draccus.run(PlayConfig)) -> None:
+def _parse_args() -> PlayConfig:
+    p = argparse.ArgumentParser(description="Play chess with SO-101 (skeleton)")
+    p.add_argument("--engine", help="Chess engine (placeholder)")
+    a = p.parse_args()
+    return PlayConfig(engine=a.engine)
+
+
+def main(cfg: PlayConfig | None = None) -> None:
+    if cfg is None:
+        cfg = _parse_args()
     if chess is None:
         log_say("python-chess not installed. Install it to use chess_play.")
         return
