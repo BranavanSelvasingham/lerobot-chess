@@ -17,6 +17,7 @@ class HomeConfig:
     port: str
     save: bool = False
     go: bool = True
+    skip_calibration: bool = False
 
 
 def _parse_args() -> HomeConfig:
@@ -24,11 +25,12 @@ def _parse_args() -> HomeConfig:
     p.add_argument("--port", required=True)
     p.add_argument("--save", action="store_true")
     p.add_argument("--go", action="store_true")
+    p.add_argument("--skip-calibration", action="store_true", help="Skip robot calibration")
     a = p.parse_args()
     # Default to go if neither flag set
     if not a.save and not a.go:
         a.go = True
-    return HomeConfig(port=a.port, save=a.save, go=a.go)
+    return HomeConfig(port=a.port, save=a.save, go=a.go, skip_calibration=getattr(a, 'skip_calibration', False))
 
 
 def main(cfg: HomeConfig | None = None) -> None:
@@ -36,7 +38,7 @@ def main(cfg: HomeConfig | None = None) -> None:
         cfg = _parse_args()
     robot_cfg = SO101FollowerConfig(port=cfg.port, id="so101_chess", cameras={}, use_degrees=True)
     robot = SO101Follower(robot_cfg)
-    robot.connect(calibrate=True, skip_firmware_check=True)
+    robot.connect(calibrate=not cfg.skip_calibration, skip_firmware_check=True)
 
     home_path = robot.calibration_dir / "home_joints.npy"
 

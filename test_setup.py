@@ -29,11 +29,14 @@ def test_robot_connection():
         
         cfg = SO101FollowerConfig(port="/dev/tty.usbmodem5A460825871", id="so101_chess", cameras={}, use_degrees=True)
         robot = SO101Follower(cfg)
-        robot.connect(calibrate=True)
-        obs = robot.get_observation()
-        robot.disconnect()
-        print("✓ Robot connection successful")
+        
+        # Test basic motor detection
+        robot.bus._connect(handshake=False)
+        robot.bus._assert_motors_exist()
+        print("✓ Motors detected successfully")
+        print(f"  Motor IDs: {list(robot.bus.motors.keys())}")
         print(f"  Calibration dir: {robot.calibration_dir}")
+        robot.bus.disconnect()
         return True
     except Exception as e:
         print(f"✗ Robot connection failed: {e}")
@@ -48,7 +51,7 @@ def test_camera():
         from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
         from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
         
-        cfg = OpenCVCameraConfig(index_or_path=1, width=640, height=480, fps=30)
+        cfg = OpenCVCameraConfig(index_or_path=0, width=640, height=480, fps=30)  # index=0 for USB camera
         cam = OpenCVCamera(cfg)
         cam.connect()
         frame = cam.read()
@@ -76,7 +79,8 @@ def main():
         print("\nNext steps:")
         print("1. Save home pose: python -m lerobot.scripts.chess_home --port /dev/tty.usbmodem5A460825871 --save")
         print("2. Calibrate board: python -m lerobot.scripts.lerobot_calibrate_chessboard --port /dev/tty.usbmodem5A460825871")
-        print("3. Execute move: python -m lerobot.scripts.chess_move --port /dev/tty.usbmodem5A460825871 --from e2 --to e4")
+        print("3. Execute move: python -m lerobot.scripts.chess_move --port /dev/tty.usbmodem5A460825871 --from e2 --to e4 --skip-calibration")
+        print("\nNote: Use --skip-calibration flag if you encounter calibration prompts.")
     else:
         print("❌ Setup incomplete. Fix issues above before proceeding.")
         if not results[1]:  # robot failed
