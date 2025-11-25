@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 
 """
-Chess Robot Monitoring UI
-Shows live camera feed, motor status, and chess board diagram.
+Chess Robot Monitoring UI with LLM Control
+Shows live camera feed, motor status, chess board diagram, and LLM-based natural language control.
 """
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QGroupBox,
-    QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox, QFrame, QToolTip, QScrollArea
+    QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox, QFrame, QToolTip, QScrollArea,
+    QTextEdit, QLineEdit, QPlainTextEdit
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QFileSystemWatcher
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush, QFont, QKeySequence, QShortcut
@@ -22,6 +23,35 @@ matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D
+import os
+from typing import Optional, Dict, Any
+
+# Load .env file if available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("✅ Loaded .env file")
+except ImportError:
+    # Try to manually load .env file
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ[key.strip()] = value.strip()
+        print("✅ Loaded .env file (manual)")
+    else:
+        print("ℹ️ No .env file found")
+
+# LLM imports
+try:
+    from openai import OpenAI
+    LLM_AVAILABLE = True
+except ImportError:
+    LLM_AVAILABLE = False
+    print("⚠️ OpenAI library not found. Install with: pip install openai")
 
 # Robot imports
 from lerobot.motors.feetech.feetech import FeetechMotorsBus
@@ -29,6 +59,20 @@ from lerobot.motors.motors_bus import Motor, MotorNormMode, MotorCalibration
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
 from lerobot.model.kinematics import RobotKinematics
+
+# Qt styling libraries
+try:
+    import qdarkstyle
+    QDARKSTYLE_AVAILABLE = True
+except ImportError:
+    QDARKSTYLE_AVAILABLE = False
+    print("ℹ️ qdarkstyle not available - install with: pip install qdarkstyle")
+
+try:
+    from lerobot.ui.style_system import StyleSystem, btn_purple, btn_primary, btn_success, btn_danger, input_dark, badge_info, badge_success, badge_warning, badge_danger, card_dark
+    STYLE_SYSTEM_AVAILABLE = True
+except ImportError:
+    STYLE_SYSTEM_AVAILABLE = False
 
 
 class ChessBoardWidget(QWidget):
@@ -619,13 +663,16 @@ class MonitoringThread(QThread):
         self.running = False
 
 
-class ChessRobotUI(QMainWindow):
-    def __init__(self, port: str, dev_mode: bool = False):
+class ChessRobotUILLM(QMainWindow):
+    def __init__(self, port: str, dev_mode: bool = False, api_key: Optional[str] = None):
         super().__init__()
         self.port = port
         self.running = False
         self.dev_mode = dev_mode
         self.file_watcher = None
+        
+        # Setup LLM
+        self.setup_llm(api_key)
         
         # Setup robot and camera
         self.setup_robot()
@@ -633,7 +680,7 @@ class ChessRobotUI(QMainWindow):
         self.setup_kinematics()
         
         # Create main window - adaptive sizing
-        self.setWindowTitle("Chess Robot Monitor - Professional Control Interface")
+        self.setWindowTitle("Chess Robot Monitor - LLM Control Interface")
         
         # Get screen size and use a reasonable fraction
         try:
@@ -662,23 +709,128 @@ class ChessRobotUI(QMainWindow):
         # Make window resizable with minimum size
         self.setMinimumSize(1200, 800)
         
+        # Terminal-like minimal styling
         self.setStyleSheet("""
             QMainWindow {
-                background: #1e2329;
-            }
-            QToolTip {
-                background-color: #2c3e50;
-                color: #ecf0f1;
-                border: 1px solid #3498db;
-                border-radius: 4px;
-                padding: 6px 10px;
-                font-size: 9pt;
+                background: #0d1117;
+                color: #c9d1d9;
             }
             QWidget {
-                selection-background-color: #3498db;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                background: #0d1117;
+                color: #c9d1d9;
+                font-family: 'Monaco', 'Menlo', 'Consolas', 'Courier New', monospace;
+                font-size: 11pt;
+            }
+            QGroupBox {
+                background: #161b22;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 0px;
+                padding-top: 15px;
+                padding-bottom: 10px;
+                padding-left: 10px;
+                padding-right: 10px;
+                margin-top: 5px;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+                color: #58a6ff;
+            }
+            QPushButton {
+                background: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 0px;
+                padding: 8px 16px;
+                font-size: 11pt;
+                font-weight: normal;
+            }
+            QPushButton:hover {
+                background: #30363d;
+                border: 1px solid #58a6ff;
+            }
+            QPushButton:pressed {
+                background: #161b22;
+            }
+            QPushButton:disabled {
+                background: #161b22;
+                color: #6e7681;
+                border: 1px solid #21262d;
+            }
+            QLabel {
+                background: transparent;
+                color: #c9d1d9;
+                border: none;
+            }
+            QLineEdit, QPlainTextEdit, QTextEdit {
+                background: #0d1117;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 0px;
+                padding: 6px;
+                font-family: 'Monaco', 'Menlo', 'Consolas', 'Courier New', monospace;
+                font-size: 11pt;
+            }
+            QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus {
+                border: 1px solid #58a6ff;
+                background: #161b22;
+            }
+            QComboBox {
+                background: #0d1117;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 0px;
+                padding: 6px;
+                font-size: 11pt;
+            }
+            QComboBox:hover {
+                border: 1px solid #58a6ff;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox QAbstractItemView {
+                background: #161b22;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                selection-background-color: #1f6feb;
+            }
+            QScrollArea {
+                border: 1px solid #30363d;
+                background: #0d1117;
+            }
+            QScrollBar:vertical {
+                background: #0d1117;
+                width: 12px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background: #30363d;
+                min-height: 20px;
+                border-radius: 0px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #484f58;
+            }
+            QFrame {
+                background: #161b22;
+                border: 1px solid #30363d;
+                border-radius: 0px;
+            }
+            QToolTip {
+                background-color: #161b22;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 0px;
+                padding: 4px 8px;
+                font-size: 10pt;
             }
         """)
+        print("✅ Applied terminal-like minimal theme")
         
         # Initialize UI components
         self.create_widgets()
@@ -747,6 +899,28 @@ class ChessRobotUI(QMainWindow):
         except Exception as e:
             print(f"⚠️ Kinematics initialization failed: {e}")
             self.kinematics = None
+    
+    def setup_llm(self, api_key: Optional[str] = None):
+        """Initialize LLM client for natural language control."""
+        self.llm_client = None
+        self.llm_enabled = False
+        
+        if not LLM_AVAILABLE:
+            print("⚠️ LLM support not available - install openai package")
+            return
+        
+        # Get API key from parameter or environment
+        api_key = api_key or os.getenv("OPENAI_API_KEY")
+        
+        if api_key:
+            try:
+                self.llm_client = OpenAI(api_key=api_key)
+                self.llm_enabled = True
+                print("✅ LLM client initialized")
+            except Exception as e:
+                print(f"⚠️ Failed to initialize LLM client: {e}")
+        else:
+            print("⚠️ No OpenAI API key provided. Set OPENAI_API_KEY environment variable or use --api-key")
         
     def create_widgets(self):
         """Create all UI widgets."""
@@ -763,17 +937,9 @@ class ChessRobotUI(QMainWindow):
         header_layout = QHBoxLayout(header_widget)
         header_layout.setSpacing(15)
         
-        # Main title - solid desktop app styling
-        title = QLabel("♟️ Chess Robot Control Center")
-        title.setStyleSheet("""
-            font-size: 20pt;
-            font-weight: 600;
-            color: #ecf0f1;
-            padding: 18px 28px;
-            background: #2c3e50;
-            border-radius: 8px;
-            border: 1px solid #34495e;
-        """)
+        # Main title - terminal style
+        title = QLabel("CHESS ROBOT CONTROL")
+        title.setStyleSheet("font-size: 14pt; font-weight: bold; color: #58a6ff;")
         title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         header_layout.addWidget(title, 1)
         
@@ -782,31 +948,15 @@ class ChessRobotUI(QMainWindow):
         status_layout = QVBoxLayout(status_widget)
         status_layout.setSpacing(5)
         
-        # Connection status - solid desktop styling
-        self.quick_status = QLabel("● Ready")
-        self.quick_status.setStyleSheet("""
-            font-size: 11pt;
-            font-weight: 600;
-            color: #27ae60;
-            padding: 10px 18px;
-            background-color: #1e3a2e;
-            border-radius: 6px;
-            border: 1px solid #27ae60;
-        """)
+        # Connection status - terminal style
+        self.quick_status = QLabel("[READY]")
+        self.quick_status.setStyleSheet("color: #3fb950; font-weight: bold;")
         self.quick_status.setAlignment(Qt.AlignCenter)
         status_layout.addWidget(self.quick_status)
         
         # Update rate indicator
-        update_label = QLabel("⏱ 10 Hz")
-        update_label.setStyleSheet("""
-            font-size: 10pt;
-            font-weight: 500;
-            color: #bdc3c7;
-            padding: 8px 18px;
-            background-color: #2c3e50;
-            border-radius: 6px;
-            border: 1px solid #34495e;
-        """)
+        update_label = QLabel("10 Hz")
+        update_label.setStyleSheet("color: #8b949e;")
         update_label.setAlignment(Qt.AlignCenter)
         update_label.setToolTip("Update rate: 10 updates per second")
         status_layout.addWidget(update_label)
@@ -822,23 +972,24 @@ class ChessRobotUI(QMainWindow):
         # Left column: Camera view
         self.create_camera_panel(panels_layout)
         
-        # Middle column: Motor status
+        # Right column: Motor status (more space now)
         self.create_motor_panel(panels_layout)
         
-        # Right column: Chess board
-        self.create_chess_panel(panels_layout)
-        
-        # Far right: Robot base coordinates
-        self.create_coordinates_panel(panels_layout)
+        # Give motor panel more space
+        panels_layout.setStretch(0, 1)  # Camera
+        panels_layout.setStretch(1, 2)  # Motors get 2x space
         
         main_layout.addLayout(panels_layout, 1)
         
-        # Bottom row: 3D Robot visualization and workspace control
+        # Bottom row: 3D Robot visualization and LLM panel (give more space to LLM)
         bottom_layout = QHBoxLayout()
         bottom_layout.setSpacing(12)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         self.create_robot_3d_panel(bottom_layout)
-        self.create_workspace_control_panel(bottom_layout)
+        llm_widget = self.create_llm_panel(bottom_layout)
+        # Give LLM panel more space (stretch factor of 2 vs 1 for 3D)
+        bottom_layout.setStretch(0, 1)  # 3D panel
+        bottom_layout.setStretch(1, 2)  # LLM panel gets 2x space
         main_layout.addLayout(bottom_layout, 1)
         
         # Bottom: Control buttons
@@ -846,123 +997,45 @@ class ChessRobotUI(QMainWindow):
         
     def create_camera_panel(self, parent_layout):
         """Create camera view panel."""
-        camera_group = QGroupBox("📸 Camera View")
-        camera_group.setStyleSheet("""
-            QGroupBox {
-                font-size: 11pt;
-                font-weight: 600;
-                color: #ecf0f1;
-                background: #2c3e50;
-                border: 2px solid #34495e;
-                border-radius: 8px;
-                padding-top: 22px;
-                padding-bottom: 18px;
-                padding-left: 18px;
-                padding-right: 18px;
-                margin-top: 8px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 18px;
-                padding: 0 10px 0 10px;
-                color: #3498db;
-            }
-        """)
-        camera_group.setToolTip("Live camera feed from robot-mounted camera. Shows real-time view of chess board.")
+        camera_group = QGroupBox("Camera")
+        # Terminal styling applied globally
+        camera_group.setToolTip("Live camera feed")
         camera_layout = QVBoxLayout(camera_group)
-        camera_layout.setSpacing(12)
-        camera_layout.setContentsMargins(12, 12, 12, 12)
+        camera_layout.setSpacing(8)
+        camera_layout.setContentsMargins(8, 8, 8, 8)
         
-        # Camera display - solid desktop styling
-        self.camera_label = QLabel("Initializing camera...")
-        self.camera_label.setStyleSheet("""
-            background-color: #1e2329;
-            color: #95a5a6;
-            padding: 15px;
-            border: 2px solid #34495e;
-            border-radius: 6px;
-            font-size: 10pt;
-        """)
+        # Camera display - terminal style
+        self.camera_label = QLabel("Initializing...")
         self.camera_label.setAlignment(Qt.AlignCenter)
         self.camera_label.setMinimumSize(300, 220)
         self.camera_label.setMaximumSize(420, 320)
         self.camera_label.setScaledContents(True)
-        self.camera_label.setToolTip("Camera feed will appear here when connected")
         camera_layout.addWidget(self.camera_label)
         
-        # Camera info bar - solid styling
+        # Camera info bar
         camera_info = QHBoxLayout()
         camera_info.setSpacing(10)
         
-        # FPS counter (will be updated)
         self.fps_label = QLabel("FPS: --")
-        self.fps_label.setStyleSheet("""
-            font-size: 9pt;
-            font-weight: 500;
-            color: #bdc3c7;
-            padding: 6px 12px;
-            background-color: #34495e;
-            border-radius: 4px;
-        """)
         camera_info.addWidget(self.fps_label)
-        
         camera_info.addStretch()
         
-        # Resolution
-        res_label = QLabel("640×480")
-        res_label.setStyleSheet("""
-            font-size: 9pt;
-            font-weight: 500;
-            color: #bdc3c7;
-            padding: 6px 12px;
-            background-color: #34495e;
-            border-radius: 4px;
-        """)
+        res_label = QLabel("640x480")
         camera_info.addWidget(res_label)
-        
         camera_layout.addLayout(camera_info)
         
-        # Camera status - solid desktop indicator
-        self.camera_status = QLabel("● Connecting...")
-        self.camera_status.setStyleSheet("""
-            font-size: 10pt;
-            font-weight: 600;
-            color: #f39c12;
-            padding: 10px 18px;
-            background-color: #3d2817;
-            border-radius: 6px;
-            border: 1px solid #f39c12;
-        """)
+        # Camera status
+        self.camera_status = QLabel("[CONNECTING]")
+        self.camera_status.setStyleSheet("color: #f0883e;")
         self.camera_status.setAlignment(Qt.AlignCenter)
-        self.camera_status.setToolTip("Camera connection status")
         camera_layout.addWidget(self.camera_status)
         
         parent_layout.addWidget(camera_group)
         
     def create_motor_panel(self, parent_layout):
         """Create motor status panel."""
-        motor_group = QGroupBox("🤖 Motor Status")
-        motor_group.setStyleSheet("""
-            QGroupBox {
-                font-size: 11pt;
-                font-weight: 600;
-                color: #ecf0f1;
-                background: #2c3e50;
-                border: 2px solid #34495e;
-                border-radius: 8px;
-                padding-top: 22px;
-                padding-bottom: 18px;
-                padding-left: 18px;
-                padding-right: 18px;
-                margin-top: 8px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 18px;
-                padding: 0 10px 0 10px;
-                color: #e74c3c;
-            }
-        """)
+        motor_group = QGroupBox("Motors")
+        # Terminal styling applied globally
         motor_group.setToolTip("Real-time motor signals: position, velocity, load, voltage, temperature, current, and control signals.")
         motor_layout = QVBoxLayout(motor_group)
         motor_layout.setSpacing(12)
@@ -971,6 +1044,7 @@ class ChessRobotUI(QMainWindow):
         # Motor signals storage - comprehensive data structure
         self.motor_labels = {}
         self.motor_signal_labels = {}  # Store all signal labels per motor
+        self.motor_status_labels = {}  # Store status indicators per motor
         
         # Create scrollable area for motor details
         from PySide6.QtWidgets import QScrollArea
@@ -989,39 +1063,21 @@ class ChessRobotUI(QMainWindow):
         # Create detailed motor displays
         for motor_name in self.all_motors.keys():
             motor_frame = QFrame()
-            motor_frame.setStyleSheet("""
-                QFrame {
-                    background: #1e2329;
-                    border: 1px solid #34495e;
-                    border-radius: 6px;
-                    padding: 10px;
-                }
-            """)
             motor_frame_layout = QVBoxLayout(motor_frame)
-            motor_frame_layout.setSpacing(8)
+            motor_frame_layout.setSpacing(6)
             
             # Motor header with name and status
             header_layout = QHBoxLayout()
             
-            motor_name_label = QLabel(f"🔧 {motor_name.replace('_', ' ').title()}")
-            motor_name_label.setStyleSheet("""
-                font-size: 11pt;
-                font-weight: 600;
-                color: #ecf0f1;
-                padding: 5px 0px;
-            """)
+            motor_name_label = QLabel(f"> {motor_name.replace('_', ' ').upper()}")
+            motor_name_label.setStyleSheet("color: #58a6ff; font-weight: bold;")
             header_layout.addWidget(motor_name_label)
             
             header_layout.addStretch()
             
             # Status indicator
-            status_label = QLabel("○")
-            status_label.setStyleSheet("""
-                font-size: 16pt;
-                color: #7f8c8d;
-                padding: 0px;
-                min-width: 20px;
-            """)
+            status_label = QLabel("[ ]")
+            status_label.setStyleSheet("color: #6e7681;")
             status_label.setAlignment(Qt.AlignCenter)
             header_layout.addWidget(status_label)
             
@@ -1048,27 +1104,14 @@ class ChessRobotUI(QMainWindow):
             
             signal_labels = {}
             for idx, (signal_name, signal_key, unit, color) in enumerate(signal_configs):
-                # Signal name
+                # Signal name - terminal style
                 name_lbl = QLabel(f"{signal_name}:")
-                name_lbl.setStyleSheet(f"""
-                    font-size: 9pt;
-                    font-weight: 500;
-                    color: #bdc3c7;
-                    padding: 4px;
-                """)
+                name_lbl.setStyleSheet("color: #8b949e;")
                 signals_grid.addWidget(name_lbl, idx, 0)
                 
-                # Signal value
+                # Signal value - terminal style
                 value_lbl = QLabel("--")
-                value_lbl.setStyleSheet(f"""
-                    font-size: 9pt;
-                    font-weight: 600;
-                    color: {color};
-                    padding: 4px 8px;
-                    background-color: #2c3e50;
-                    border-radius: 3px;
-                    border: 1px solid #34495e;
-                """)
+                value_lbl.setStyleSheet("color: #c9d1d9;")
                 value_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 signals_grid.addWidget(value_lbl, idx, 1)
                 
@@ -1085,20 +1128,10 @@ class ChessRobotUI(QMainWindow):
         scroll.setWidget(scroll_widget)
         motor_layout.addWidget(scroll)
         
-        # Overall robot status - solid desktop design
-        self.robot_status = QLabel("● Connecting...")
-        self.robot_status.setStyleSheet("""
-            font-size: 10pt;
-            font-weight: 600;
-            color: #f39c12;
-            padding: 12px 18px;
-            background-color: #3d2817;
-            border: 1px solid #f39c12;
-            border-radius: 6px;
-            margin-top: 12px;
-        """)
+        # Overall robot status - terminal style
+        self.robot_status = QLabel("[CONNECTING]")
+        self.robot_status.setStyleSheet("color: #f0883e; font-weight: bold;")
         self.robot_status.setAlignment(Qt.AlignCenter)
-        self.robot_status.setToolTip("Overall robot system status")
         motor_layout.addWidget(self.robot_status)
         
         parent_layout.addWidget(motor_group)
@@ -1320,50 +1353,20 @@ class ChessRobotUI(QMainWindow):
     
     def create_robot_3d_panel(self, parent_layout):
         """Create 3D robot visualization panel."""
-        robot_3d_group = QGroupBox("🤖 3D Visualization")
-        robot_3d_group.setStyleSheet("""
-            QGroupBox {
-                font-size: 11pt;
-                font-weight: 600;
-                color: #ecf0f1;
-                background: #2c3e50;
-                border: 2px solid #34495e;
-                border-radius: 8px;
-                padding-top: 22px;
-                padding-bottom: 18px;
-                padding-left: 18px;
-                padding-right: 18px;
-                margin-top: 8px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 18px;
-                padding: 0 10px 0 10px;
-                color: #9b59b6;
-            }
-        """)
-        robot_3d_group.setToolTip("Interactive 3D visualization of robot arm. Drag to rotate, scroll to zoom.")
+        robot_3d_group = QGroupBox("3D View")
         robot_3d_layout = QVBoxLayout(robot_3d_group)
-        robot_3d_layout.setSpacing(12)
-        robot_3d_layout.setContentsMargins(12, 12, 12, 12)
+        robot_3d_layout.setSpacing(8)
+        robot_3d_layout.setContentsMargins(8, 8, 8, 8)
         
-        # Create 3D robot widget - solid desktop sizing
+        # Create 3D robot widget
         self.robot_3d_widget = Robot3DWidget()
         self.robot_3d_widget.setMinimumSize(400, 350)
         self.robot_3d_widget.setMaximumSize(800, 600)
         robot_3d_layout.addWidget(self.robot_3d_widget, alignment=Qt.AlignCenter)
         
-        # Info label - solid desktop styling
-        info_label = QLabel("🖱️ Drag to rotate • 🔍 Scroll to zoom")
-        info_label.setStyleSheet("""
-            font-size: 9pt;
-            font-weight: 500;
-            color: #95a5a6;
-            padding: 10px;
-            background-color: #1e2329;
-            border-radius: 4px;
-            border: 1px solid #34495e;
-        """)
+        # Info label - terminal style
+        info_label = QLabel("Drag to rotate | Scroll to zoom")
+        info_label.setStyleSheet("color: #8b949e;")
         info_label.setAlignment(Qt.AlignCenter)
         robot_3d_layout.addWidget(info_label)
         
@@ -1372,106 +1375,35 @@ class ChessRobotUI(QMainWindow):
     def create_control_panel(self, parent_layout):
         """Create control buttons panel."""
         control_frame = QFrame()
-        control_frame.setStyleSheet("""
-            background-color: #2c3e50;
-            border-top: 2px solid #34495e;
-        """)
         control_layout = QHBoxLayout(control_frame)
-        control_layout.setSpacing(15)
-        control_layout.setContentsMargins(20, 15, 20, 15)
+        control_layout.setSpacing(10)
+        control_layout.setContentsMargins(10, 10, 10, 10)
         
-        # Control buttons - solid desktop app styling
-        go_home_btn = QPushButton("🏠 Go Home")
-        go_home_btn.setStyleSheet("""
-            QPushButton {
-                background: #27ae60;
-                color: white;
-                font-size: 11pt;
-                font-weight: 600;
-                padding: 12px 28px;
-                border: 1px solid #229954;
-                border-radius: 6px;
-            }
-            QPushButton:hover {
-                background: #229954;
-                border: 1px solid #1e8449;
-            }
-            QPushButton:pressed {
-                background: #1e8449;
-            }
-        """)
+        # Control buttons - terminal style
+        go_home_btn = QPushButton("HOME")
         go_home_btn.setToolTip("Move robot to home position (Ctrl+H)")
         go_home_btn.clicked.connect(self.go_home)
-        # Keyboard shortcut
         QShortcut(QKeySequence("Ctrl+H"), self).activated.connect(self.go_home)
         control_layout.addWidget(go_home_btn)
         
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.setStyleSheet("""
-            QPushButton {
-                background: #3498db;
-                color: white;
-                font-size: 11pt;
-                font-weight: 600;
-                padding: 12px 28px;
-                border: 1px solid #2980b9;
-                border-radius: 6px;
-            }
-            QPushButton:hover {
-                background: #2980b9;
-                border: 1px solid #21618c;
-            }
-            QPushButton:pressed {
-                background: #21618c;
-            }
-        """)
+        refresh_btn = QPushButton("REFRESH")
         refresh_btn.setToolTip("Refresh all displays (F5)")
         refresh_btn.clicked.connect(self.refresh_status)
-        # Keyboard shortcut
         QShortcut(QKeySequence("F5"), self).activated.connect(self.refresh_status)
         control_layout.addWidget(refresh_btn)
         
         control_layout.addStretch()
         
-        stop_btn = QPushButton("🛑 Stop")
-        stop_btn.setStyleSheet("""
-            QPushButton {
-                background: #e74c3c;
-                color: white;
-                font-size: 11pt;
-                font-weight: 600;
-                padding: 12px 28px;
-                border: 1px solid #c0392b;
-                border-radius: 6px;
-            }
-            QPushButton:hover {
-                background: #c0392b;
-                border: 1px solid #a93226;
-            }
-            QPushButton:pressed {
-                background: #a93226;
-            }
-        """)
+        stop_btn = QPushButton("STOP")
         stop_btn.setToolTip("Stop monitoring and close application (Ctrl+Q)")
         stop_btn.clicked.connect(self.stop_monitoring)
-        # Keyboard shortcut
         QShortcut(QKeySequence("Ctrl+Q"), self).activated.connect(self.stop_monitoring)
         control_layout.addWidget(stop_btn)
         
-        # Status bar - solid desktop app styling
-        self.status_bar = QLabel("Initializing...")
-        self.status_bar.setStyleSheet("""
-            font-size: 10pt;
-            font-weight: 500;
-            color: #ecf0f1;
-            padding: 12px 20px;
-            background-color: #1e2329;
-            border: 1px solid #34495e;
-            border-radius: 6px;
-            min-width: 350px;
-        """)
+        # Status bar - terminal style
+        self.status_bar = QLabel("> Initializing...")
+        self.status_bar.setStyleSheet("color: #8b949e;")
         self.status_bar.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.status_bar.setToolTip("Current system status and messages")
         control_layout.addWidget(self.status_bar, 1)
         
         parent_layout.addWidget(control_frame)
@@ -1789,6 +1721,273 @@ class ChessRobotUI(QMainWindow):
         self.workspace_side_canvas.update()
         self.workspace_top_canvas.update()
     
+    def create_llm_panel(self, parent_layout):
+        """Create LLM natural language control panel."""
+        llm_group = QGroupBox("LLM Control")
+        # Terminal-like styling is applied globally, no need for custom styles here
+        llm_group.setToolTip("Control robot using natural language commands. LLM generates motor positions from your instructions.")
+        llm_layout = QVBoxLayout(llm_group)
+        llm_layout.setSpacing(12)
+        llm_layout.setContentsMargins(12, 12, 12, 12)
+        
+        # Model selection and status row
+        model_status_layout = QHBoxLayout()
+        model_status_layout.setSpacing(10)
+        
+        # Model selection
+        model_label = QLabel("Model:")
+        model_status_layout.addWidget(model_label)
+        
+        self.llm_model_combo = QComboBox()
+        self.llm_model_combo.addItems([
+            "gpt-4o-mini",
+            "gpt-4o",
+            "gpt-4-turbo",
+            "gpt-3.5-turbo"
+        ])
+        self.llm_model_combo.setCurrentText("gpt-4o-mini")
+        self.llm_model_combo.setMinimumWidth(150)
+        model_status_layout.addWidget(self.llm_model_combo)
+        model_status_layout.addStretch()
+        
+        # LLM status
+        self.llm_status = QLabel("[READY]" if self.llm_enabled else "[NOT AVAILABLE]")
+        if self.llm_enabled:
+            self.llm_status.setStyleSheet("color: #3fb950;")  # Green for ready
+        else:
+            self.llm_status.setStyleSheet("color: #f85149;")  # Red for not available
+        self.llm_status.setAlignment(Qt.AlignCenter)
+        model_status_layout.addWidget(self.llm_status)
+        llm_layout.addLayout(model_status_layout)
+        
+        # Command input
+        command_label = QLabel("> Command:")
+        llm_layout.addWidget(command_label)
+        
+        self.llm_command_input = QPlainTextEdit()
+        self.llm_command_input.setPlaceholderText("Enter command... (e.g., move arm to e2)")
+        self.llm_command_input.setMinimumHeight(80)
+        llm_layout.addWidget(self.llm_command_input)
+        
+        # Execute button
+        execute_btn = QPushButton("EXECUTE")
+        execute_btn.setEnabled(self.llm_enabled)
+        execute_btn.clicked.connect(self.execute_llm_command)
+        llm_layout.addWidget(execute_btn)
+        
+        # LLM Reasoning/Explanation display (larger, more prominent)
+        reasoning_label = QLabel("> Reasoning:")
+        llm_layout.addWidget(reasoning_label)
+        
+        self.llm_reasoning_display = QTextEdit()
+        self.llm_reasoning_display.setReadOnly(True)
+        self.llm_reasoning_display.setPlaceholderText("LLM reasoning will appear here...")
+        self.llm_reasoning_display.setStyleSheet("color: #f0883e;")  # Orange for reasoning
+        self.llm_reasoning_display.setMinimumHeight(150)
+        llm_layout.addWidget(self.llm_reasoning_display, 2)  # Give it stretch factor of 2
+        
+        # LLM response display (full JSON)
+        response_label = QLabel("> Response (JSON):")
+        llm_layout.addWidget(response_label)
+        
+        self.llm_response_display = QTextEdit()
+        self.llm_response_display.setReadOnly(True)
+        self.llm_response_display.setStyleSheet("color: #8b949e;")  # Gray for JSON
+        self.llm_response_display.setMinimumHeight(120)
+        llm_layout.addWidget(self.llm_response_display, 1)
+        
+        # Action preview
+        preview_label = QLabel("> Action (Validated):")
+        llm_layout.addWidget(preview_label)
+        
+        self.llm_action_preview = QTextEdit()
+        self.llm_action_preview.setReadOnly(True)
+        self.llm_action_preview.setStyleSheet("color: #58a6ff;")  # Blue for action
+        self.llm_action_preview.setMinimumHeight(100)
+        llm_layout.addWidget(self.llm_action_preview, 1)
+        
+        parent_layout.addWidget(llm_group)
+        return llm_group  # Return widget for stretch factor setting
+    
+    def execute_llm_command(self):
+        """Execute LLM command and control robot."""
+        if not self.llm_enabled or not self.llm_client:
+            self.status_bar.setText("❌ LLM not available")
+            return
+        
+        command = self.llm_command_input.toPlainText().strip()
+        if not command:
+            self.status_bar.setText("⚠️ Please enter a command")
+            return
+        
+        self.status_bar.setText("🤖 Processing LLM command...")
+        self.llm_response_display.setText("Processing...")
+        self.llm_reasoning_display.setText("Processing...")
+        self.llm_action_preview.setText("")
+        
+        try:
+            # Get current robot state
+            current_positions = {}
+            for motor_name in self.all_motors.keys():
+                try:
+                    pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                    current_positions[motor_name] = pos
+                except:
+                    current_positions[motor_name] = 0
+            
+            # Get selected model
+            selected_model = self.llm_model_combo.currentText()
+            
+            # Build prompt for LLM
+            prompt = self._build_llm_prompt(command, current_positions)
+            
+            # Call LLM
+            response = self.llm_client.chat.completions.create(
+                model=selected_model,
+                messages=[
+                    {"role": "system", "content": "You are a robot control assistant. Provide detailed reasoning for your actions. Output only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3  # Lower temperature for more consistent outputs
+            )
+            
+            # Parse response
+            llm_output = json.loads(response.choices[0].message.content)
+            
+            # Display full response
+            self.llm_response_display.setText(json.dumps(llm_output, indent=2))
+            
+            # Display reasoning/explanation prominently
+            explanation = llm_output.get("explanation", "No explanation provided")
+            reasoning_text = f"{explanation}\n\n"
+            
+            # Add reasoning about motor changes if available
+            action = llm_output.get("action", {})
+            if action:
+                reasoning_text += "Motor Changes:\n"
+                for motor_key, value in action.items():
+                    motor_name = motor_key.replace(".pos", "")
+                    current = current_positions.get(motor_name, 0)
+                    change = value - current
+                    reasoning_text += f"  • {motor_name}: {current:.1f}° → {value:.1f}° (Δ{change:+.1f}°)\n"
+            
+            self.llm_reasoning_display.setText(reasoning_text)
+            
+            # Validate and execute
+            safe_action = self._validate_llm_action(action, current_positions)
+            
+            if safe_action:
+                self.llm_action_preview.setText(json.dumps(safe_action, indent=2))
+                self._execute_llm_action(safe_action)
+                self.status_bar.setText(f"✅ LLM command executed successfully (using {selected_model})")
+            else:
+                self.status_bar.setText("❌ LLM action failed validation")
+                self.llm_action_preview.setText("Action validation failed - unsafe values detected")
+                self.llm_reasoning_display.setText(
+                    self.llm_reasoning_display.toPlainText() + 
+                    "\n\n⚠️ VALIDATION FAILED: Action was rejected for safety reasons."
+                )
+                
+        except json.JSONDecodeError as e:
+            self.status_bar.setText(f"❌ Invalid JSON from LLM: {e}")
+            self.llm_response_display.setText(f"Error: Invalid JSON response\n{response.choices[0].message.content if 'response' in locals() else 'No response'}")
+        except Exception as e:
+            self.status_bar.setText(f"❌ LLM error: {str(e)[:50]}...")
+            self.llm_response_display.setText(f"Error: {str(e)}")
+    
+    def _build_llm_prompt(self, command: str, current_positions: Dict[str, float]) -> str:
+        """Build prompt for LLM with robot context."""
+        prompt = f"""You control a 5-DOF robot arm for chess piece manipulation.
+
+Available motors:
+- shoulder_pan: horizontal rotation (degrees, range: -180 to 180)
+- shoulder_lift: vertical lift (degrees, range: -90 to 90)
+- elbow_flex: elbow bend (degrees, range: -90 to 90)
+- wrist_flex: wrist bend (degrees, range: -90 to 90)
+- gripper: open/close (0-100%, 0=open, 100=closed)
+
+Current motor positions:
+{json.dumps(current_positions, indent=2)}
+
+User command: {command}
+
+Output a JSON object with this structure:
+{{
+  "action": {{
+    "shoulder_pan.pos": <float>,
+    "shoulder_lift.pos": <float>,
+    "elbow_flex.pos": <float>,
+    "wrist_flex.pos": <float>,
+    "gripper.pos": <float>
+  }},
+  "explanation": "<brief explanation of the action>"
+}}
+
+Important:
+- Only include motors that need to change
+- Keep changes small and safe (max 10-20 degrees per step)
+- Ensure gripper values are between 0-100
+- Ensure joint angles are within safe ranges
+"""
+        return prompt
+    
+    def _validate_llm_action(self, action: Dict[str, Any], current_positions: Dict[str, float]) -> Optional[Dict[str, float]]:
+        """Validate and clamp LLM-generated action to safe values."""
+        if not isinstance(action, dict):
+            return None
+        
+        safe_action = {}
+        max_change = 20.0  # Maximum degrees change per step
+        
+        for motor_name, value in action.items():
+            # Remove .pos suffix if present
+            motor_key = motor_name.replace(".pos", "")
+            
+            if motor_key not in self.all_motors:
+                continue
+            
+            try:
+                target_value = float(value)
+                current_value = current_positions.get(motor_key, 0)
+                
+                # Check change magnitude
+                change = abs(target_value - current_value)
+                if change > max_change:
+                    # Clamp to max change
+                    if target_value > current_value:
+                        target_value = current_value + max_change
+                    else:
+                        target_value = current_value - max_change
+                
+                # Gripper-specific validation
+                if motor_key == "gripper":
+                    target_value = max(0.0, min(100.0, target_value))
+                else:
+                    # Joint angle validation (rough bounds)
+                    target_value = max(-180.0, min(180.0, target_value))
+                
+                safe_action[f"{motor_key}.pos"] = target_value
+                
+            except (ValueError, TypeError):
+                continue
+        
+        return safe_action if safe_action else None
+    
+    def _execute_llm_action(self, action: Dict[str, float]):
+        """Execute validated LLM action on robot."""
+        try:
+            for motor_key, value in action.items():
+                motor_name = motor_key.replace(".pos", "")
+                if motor_name in self.all_motors:
+                    self.bus.write("Goal_Position", motor_name, value, normalize=True)
+                    time.sleep(0.1)  # Small delay between commands
+            
+            self.status_bar.setText("✅ LLM action executed")
+        except Exception as e:
+            self.status_bar.setText(f"❌ Execution error: {str(e)[:50]}...")
+            raise
+    
     def move_gripper(self, dx_mm, dy_mm, dz_mm):
         """Move gripper by specified amounts in base coordinates."""
         try:
@@ -1960,16 +2159,8 @@ class ChessRobotUI(QMainWindow):
     def update_camera(self, pixmap):
         """Update camera view from monitoring thread."""
         self.camera_label.setPixmap(pixmap)
-        self.camera_status.setText("● Live")
-        self.camera_status.setStyleSheet("""
-            font-size: 10pt;
-            font-weight: 500;
-            color: #27ae60;
-            padding: 8px 15px;
-            background-color: rgba(39, 174, 96, 20);
-            border-radius: 8px;
-            border: 1px solid rgba(39, 174, 96, 60);
-        """)
+        self.camera_status.setText("[LIVE]")
+        self.camera_status.setStyleSheet("color: #3fb950;")
         
         # Update FPS (simple counter - could be improved)
         if not hasattr(self, '_frame_count'):
@@ -2059,13 +2250,8 @@ class ChessRobotUI(QMainWindow):
                         signal_labels["torque_enable"].setText("--")
                     
                     # Update status indicator
-                    self.motor_status_labels[motor_name].setText("●")
-                    self.motor_status_labels[motor_name].setStyleSheet("""
-                        font-size: 16pt;
-                        color: #27ae60;
-                        padding: 0px;
-                        min-width: 20px;
-                    """)
+                    self.motor_status_labels[motor_name].setText("[OK]")
+                    self.motor_status_labels[motor_name].setStyleSheet("color: #3fb950;")
                 else:
                     all_good = False
                     # Show error for all signals
@@ -2082,171 +2268,60 @@ class ChessRobotUI(QMainWindow):
                             border: 1px solid #e74c3c;
                         """)
                     
-                    self.motor_status_labels[motor_name].setText("○")
-                    self.motor_status_labels[motor_name].setStyleSheet("""
-                        font-size: 16pt;
-                        color: #e74c3c;
-                        padding: 0px;
-                        min-width: 20px;
-                    """)
+                    self.motor_status_labels[motor_name].setText("[ERR]")
+                    self.motor_status_labels[motor_name].setStyleSheet("color: #f85149;")
                 
                 # Update robot overall status
                 if all_good:
-                self.robot_status.setText("● All Motors OK")
-                self.robot_status.setStyleSheet("""
-                    font-size: 10pt;
-                    font-weight: 500;
-                    color: #27ae60;
-                    padding: 10px 15px;
-                    background-color: rgba(39, 174, 96, 20);
-                    border: 1px solid rgba(39, 174, 96, 60);
-                    border-radius: 8px;
-                """)
-                self.quick_status.setText("● Ready")
-                self.quick_status.setStyleSheet("""
-                    font-size: 11pt;
-                    font-weight: bold;
-                    color: #27ae60;
-                    padding: 8px 15px;
-                    background-color: rgba(39, 174, 96, 30);
-                    border-radius: 8px;
-                    border: 1px solid rgba(39, 174, 96, 100);
-                """)
-                
-                # Calculate robot base coordinates
-                joint_positions = {name: data["position"] for name, data in motor_data.items() 
-                                 if data["position"] is not None}
-                
-                # Update 3D robot visualization
-                if hasattr(self, 'robot_3d_widget') and len(joint_positions) >= 5:
-                    joint_angles = {
-                        "shoulder_pan": joint_positions.get("shoulder_pan", 0),
-                        "shoulder_lift": joint_positions.get("shoulder_lift", 0),
-                        "elbow_flex": joint_positions.get("elbow_flex", 0),
-                        "wrist_flex": joint_positions.get("wrist_flex", 0),
-                        "wrist_roll": joint_positions.get("wrist_roll", 0),
-                        "gripper": joint_positions.get("gripper", 0)
-                    }
-                    self.robot_3d_widget.update_joints(joint_angles)
-                
-                if len(joint_positions) >= 5:
+                    self.robot_status.setText("[OK]")
+                    self.robot_status.setStyleSheet("color: #3fb950; font-weight: bold;")
+                    self.quick_status.setText("[READY]")
+                    self.quick_status.setStyleSheet("color: #3fb950; font-weight: bold;")
+                    
+                    # Calculate robot base coordinates
+                    joint_positions = {name: data["position"] for name, data in motor_data.items() 
+                                     if data["position"] is not None}
+                    
+                    # Update 3D robot visualization
+                    if hasattr(self, 'robot_3d_widget') and len(joint_positions) >= 5:
+                        joint_angles = {
+                            "shoulder_pan": joint_positions.get("shoulder_pan", 0),
+                            "shoulder_lift": joint_positions.get("shoulder_lift", 0),
+                            "elbow_flex": joint_positions.get("elbow_flex", 0),
+                            "wrist_flex": joint_positions.get("wrist_flex", 0),
+                            "wrist_roll": joint_positions.get("wrist_roll", 0),
+                            "gripper": joint_positions.get("gripper", 0)
+                        }
+                        self.robot_3d_widget.update_joints(joint_angles)
+                    
+                    if len(joint_positions) >= 5:
+                        # Calculate coordinates for internal use (not displayed)
                         x_mm, y_mm, z_mm, method = self.calculate_base_coordinates(joint_positions)
                         
-                        # Update coordinate display
-                    self.coord_x.setText(f"X: {x_mm:6.1f} mm")
-                    self.coord_y.setText(f"Y: {y_mm:6.1f} mm")
-                    self.coord_z.setText(f"Z: {z_mm:6.1f} mm")
-                        
-                        # Calculate distance from base
-                        distance = np.sqrt(x_mm**2 + y_mm**2 + z_mm**2)
-                    self.distance_label.setText(f"Distance: {distance:.1f} mm")
-                        
-                        # Update workspace status
-                    workspace_text = f"Method: {method} | Distance: {distance:.0f}mm"
-                        if distance < 400:
-                        workspace_color = '#27ae60'
-                        elif distance < 500:
-                        workspace_color = '#f39c12'
-                        else:
-                        workspace_color = '#e74c3c'
-                    
-                    self.workspace_status.setText(workspace_text)
-                    self.workspace_status.setStyleSheet(f"""
-                        font-size: 9pt;
-                        color: {workspace_color};
-                        padding: 4px 0px;
-                    """)
-                        
-                        # Update workspace visualization
-                        self.update_workspace_position(x_mm, y_mm, z_mm)
-                        self.update_workspace_display(x_mm, y_mm, z_mm)
-                        
-                        # Update current position in control panel
-                    pos_text = f"Current Position:\nX: {x_mm:6.1f} mm | Y: {y_mm:6.1f} mm | Z: {z_mm:6.1f} mm"
-                    self.current_pos_label.setText(pos_text)
-                        
-                    # Update workspace bounds
-                        bounds_text = f"X: [{x_mm-100:.0f}, {x_mm+100:.0f}] mm\nY: [{y_mm-100:.0f}, {y_mm+100:.0f}] mm\nZ: [{z_mm-50:.0f}, {z_mm+50:.0f}] mm"
-                    self.workspace_bounds.setText(bounds_text)
-                        
-                        # Update joint configuration display
+                        # Update joint configuration display (if it exists)
                         pan = joint_positions.get("shoulder_pan", 0)
                         lift = joint_positions.get("shoulder_lift", 0)
                         elbow = joint_positions.get("elbow_flex", 0)
                         wrist_flex = joint_positions.get("wrist_flex", 0)
                         wrist_roll = joint_positions.get("wrist_roll", 0)
                         
-                    config_text = f"Shoulder: {pan:.1f}°, {lift:.1f}° | Elbow: {elbow:.1f}° | Wrist: {wrist_flex:.1f}°, {wrist_roll:.1f}°"
-                    self.joint_config.setText(config_text)
-                    
-                    # Calculate robot position on chess board
-                    if "shoulder_pan" in motor_data and "shoulder_lift" in motor_data:
-                        if motor_data["shoulder_pan"]["position"] is not None and motor_data["shoulder_lift"]["position"] is not None:
-                        square = self.calculate_robot_square(
-                            motor_data["shoulder_pan"]["position"],
-                            motor_data["shoulder_lift"]["position"]
-                        )
-                        if square:
-                                self.robot_position_label.setText(f"📍 {square.upper()}")
-                            
-                            pan_pos = motor_data["shoulder_pan"]["position"]
-                            lift_pos = motor_data["shoulder_lift"]["position"]
-                            elbow_pos = motor_data.get("elbow_flex", {}).get("position", 0)
-                            
-                                details_text = f"Position: {square.upper()} | Pan: {pan_pos:.1f}° | Lift: {lift_pos:.1f}° | Elbow: {elbow_pos:.1f}°"
-                            self.robot_details.setText(details_text)
-                            self.robot_details.setStyleSheet("font-size: 9pt; color: #27ae60; padding: 5px;")
-                            
-                            # Highlight on chess board
-                            self.chess_board.set_robot_square(square)
-                        else:
-                            self.robot_position_label.setText("📍 Off board")
-                            self.robot_details.setText("Position: Off board\nMove robot over\nchessboard")
-                            self.robot_details.setStyleSheet("font-size: 9pt; color: #f39c12; padding: 5px;")
-                            self.chess_board.set_robot_square(None)
+                        # Only update if joint_config widget exists (from coordinates panel)
+                        if hasattr(self, 'joint_config'):
+                            config_text = f"Shoulder: {pan:.1f}°, {lift:.1f}° | Elbow: {elbow:.1f}° | Wrist: {wrist_flex:.1f}°, {wrist_roll:.1f}°"
+                            self.joint_config.setText(config_text)
+                        
+                        # Chess board calculations removed - panel no longer displayed
                 else:
-                self.robot_status.setText("⚠ Motor Issues")
-                self.robot_status.setStyleSheet("""
-                    font-size: 10pt;
-                    font-weight: 500;
-                    color: #f39c12;
-                    padding: 10px 15px;
-                    background-color: rgba(243, 156, 18, 20);
-                    border: 1px solid rgba(243, 156, 18, 60);
-                    border-radius: 8px;
-                """)
-                self.quick_status.setText("⚠ Warning")
-                self.quick_status.setStyleSheet("""
-                    font-size: 11pt;
-                    font-weight: bold;
-                    color: #f39c12;
-                    padding: 8px 15px;
-                    background-color: rgba(243, 156, 18, 30);
-                    border-radius: 8px;
-                    border: 1px solid rgba(243, 156, 18, 100);
-                """)
+                    self.robot_status.setText("[WARN]")
+                    self.robot_status.setStyleSheet("color: #f0883e; font-weight: bold;")
+                    self.quick_status.setText("[WARN]")
+                    self.quick_status.setStyleSheet("color: #f0883e; font-weight: bold;")
                 
         except Exception as e:
-            self.robot_status.setText("❌ Comm Error")
-            self.robot_status.setStyleSheet("""
-                font-size: 10pt;
-                font-weight: 500;
-                color: #e74c3c;
-                padding: 10px 15px;
-                background-color: rgba(231, 76, 60, 20);
-                border: 1px solid rgba(231, 76, 60, 60);
-                border-radius: 8px;
-            """)
-            self.quick_status.setText("● Error")
-            self.quick_status.setStyleSheet("""
-                font-size: 11pt;
-                font-weight: bold;
-                color: #e74c3c;
-                padding: 8px 15px;
-                background-color: rgba(231, 76, 60, 30);
-                border-radius: 8px;
-                border: 1px solid rgba(231, 76, 60, 100);
-            """)
+            self.robot_status.setText("[ERROR]")
+            self.robot_status.setStyleSheet("color: #f85149; font-weight: bold;")
+            self.quick_status.setText("[ERROR]")
+            self.quick_status.setStyleSheet("color: #f85149; font-weight: bold;")
     
     def start_monitoring(self):
         """Start monitoring threads."""
@@ -2314,37 +2389,33 @@ class ChessRobotUI(QMainWindow):
     def on_file_changed(self, path):
         """Called when the watched file changes."""
         if self.dev_mode:
-            # Update status bar with restart notification
-            self.status_bar.setText("🔄 Code changed! Please restart the app to see changes.")
-            self.status_bar.setStyleSheet("""
-                font-size: 10pt;
-                font-weight: 600;
-                color: #f39c12;
-                padding: 12px 20px;
-                background-color: #3d2817;
-                border: 2px solid #f39c12;
-                border-radius: 6px;
-                min-width: 350px;
-            """)
-            print(f"📝 File changed: {path}")
-            print("   Please restart the app manually to see changes.")
+            # Update status bar with restart notification - terminal style
+            self.status_bar.setText("> Code changed! Restart app to see changes.")
+            self.status_bar.setStyleSheet("color: #f0883e;")
+            print(f"> File changed: {path}")
+            print("  Please restart the app manually to see changes.")
 
 
 def main():
     import argparse
-    p = argparse.ArgumentParser(description="Chess Robot Monitoring UI")
+    p = argparse.ArgumentParser(description="Chess Robot Monitoring UI with LLM Control")
     p.add_argument("--port", required=True, help="Robot serial port")
     p.add_argument("--dev", action="store_true", help="Enable development mode with file watching")
+    p.add_argument("--api-key", type=str, help="OpenAI API key (or set OPENAI_API_KEY env var)")
     args = p.parse_args()
     
     app = QApplication([])
     
     try:
-        ui = ChessRobotUI(args.port, dev_mode=args.dev)
+        ui = ChessRobotUILLM(args.port, dev_mode=args.dev, api_key=args.api_key)
         ui.show()
-        print("🚀 Starting Chess Robot UI...")
+        print("🚀 Starting Chess Robot UI with LLM Control...")
         if args.dev:
             print("🔧 Development mode: File watching enabled")
+        if ui.llm_enabled:
+            print("✅ LLM control enabled")
+        else:
+            print("⚠️ LLM control disabled - set OPENAI_API_KEY or use --api-key")
         print("Close the window or click 'Stop' to exit")
         app.exec()
     except Exception as e:
