@@ -8,7 +8,7 @@ Shows live camera feed, motor status, chess board diagram, and LLM-based natural
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QGroupBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox, QFrame, QToolTip, QScrollArea,
-    QTextEdit, QLineEdit, QPlainTextEdit
+    QTextEdit, QLineEdit, QPlainTextEdit, QSizePolicy, QCheckBox, QSpinBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QFileSystemWatcher
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush, QFont, QKeySequence, QShortcut
@@ -18,13 +18,15 @@ import time
 import numpy as np
 from pathlib import Path
 from PIL import Image
+import base64
+import io
 import matplotlib
 matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 # Load .env file if available
 try:
@@ -52,6 +54,14 @@ try:
 except ImportError:
     LLM_AVAILABLE = False
     print("⚠️ OpenAI library not found. Install with: pip install openai")
+
+# ChatKit Python SDK imports
+try:
+    from chatkit import ChatKitServer
+    CHATKIT_SDK_AVAILABLE = True
+except ImportError:
+    CHATKIT_SDK_AVAILABLE = False
+    # Note: ChatKit Python SDK is optional - install with: pip install openai-chatkit
 
 # Robot imports
 from lerobot.motors.feetech.feetech import FeetechMotorsBus
@@ -547,105 +557,184 @@ class Robot3DWidget(QWidget):
         self.draw_robot()
 
 
-class MonitoringThread(QThread):
-    """Thread for monitoring robot and camera."""
+class LLMExecutionThread(QThread):
+    """Thread for executing LLM commands - prevents UI blocking."""
     
-    camera_update = Signal(object)  # QPixmap
+    status_update = Signal(str)
+    reasoning_update = Signal(str)
+    response_update = Signal(str)
+    action_preview_update = Signal(str)
+    finished_signal = Signal(bool, str)  # success, message
+    
+    def __init__(self, ui_instance, command: str, parent=None):
+        super().__init__(parent)
+        self.ui = ui_instance
+        self.command = command
+        self.running = True
+    
+    def run(self):
+        """Execute LLM command in background thread."""
+        try:
+            # Call the actual execution method
+            self.ui._execute_llm_command_internal(self.command, self)
+        except Exception as e:
+            self.finished_signal.emit(False, f"Execution error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    def stop(self):
+        """Stop execution."""
+        self.running = False
+
+
+class MonitoringThread(QThread):
+    """Thread for monitoring robot and cameras."""
+    
+    main_camera_update = Signal(object)  # QPixmap for main camera
+    gripper_camera_update = Signal(object)  # QPixmap for gripper camera
     motor_update = Signal(dict)  # Motor data dict
     status_update = Signal(str)  # Status message
     
-    def __init__(self, bus, camera, parent=None):
+    def __init__(self, bus, cameras, parent=None):
         super().__init__(parent)
         self.bus = bus
-        self.camera = camera
+        self.cameras = cameras  # dict of cameras
         self.running = False
+        self.paused = False  # Pause motor reads during command execution to avoid port conflicts
         
     def run(self):
         """Main monitoring loop."""
         try:
             # Connect systems
             self.bus._connect(handshake=False)
-            self.camera.connect()
             
-            self.status_update.emit("✅ Robot and camera connected - Live monitoring active")
+            # Connect all cameras
+            for cam_name, camera in self.cameras.items():
+                try:
+                    camera.connect()
+                    print(f"✅ {cam_name} camera connected")
+                except Exception as e:
+                    print(f"⚠️ {cam_name} camera connection failed: {e}")
+            
+            self.status_update.emit("✅ Robot and cameras connected - Live monitoring active")
+            
+            # Performance optimization: separate update counters
+            iteration = 0
+            motor_update_counter = 0
+            # Track motors that are having issues to skip them temporarily
+            motor_skip_count = {}  # motor_name -> skip countdown
             
             while self.running:
-                # Update camera
+                iteration += 1
+                
+                # Update main camera (every iteration for smooth video)
                 try:
-                    if self.camera.is_connected:
-                        frame = self.camera.read()
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        frame_resized = cv2.resize(frame_rgb, (320, 240))
-                        
-                        height, width, channel = frame_resized.shape
-                        bytes_per_line = 3 * width
-                        q_image = QImage(frame_resized.data, width, height, bytes_per_line, QImage.Format_RGB888)
-                        pixmap = QPixmap.fromImage(q_image)
-                        self.camera_update.emit(pixmap)
+                    main_cam = self.cameras.get("main")
+                    if main_cam and main_cam.is_connected:
+                        frame = main_cam.read()
+                        if frame is not None and frame.size > 0:
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            frame_resized = cv2.resize(frame_rgb, (640, 360))  # 16:9 for main camera
+                            
+                            height, width, channel = frame_resized.shape
+                            bytes_per_line = 3 * width
+                            q_image = QImage(frame_resized.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                            pixmap = QPixmap.fromImage(q_image)
+                            self.main_camera_update.emit(pixmap)
                 except Exception as e:
                     pass
                 
-                # Update motors - read all available signals
+                # Update gripper camera (every iteration for smooth video)
                 try:
-                    if self.bus.is_connected:
-                        motor_data = {}
-                        for motor_name in ["shoulder_pan", "shoulder_lift", "elbow_flex", 
-                                         "wrist_flex", "wrist_roll", "gripper"]:
-                            try:
-                                # Read all available signals
-                                pos = self.bus.read("Present_Position", motor_name, normalize=True)
-                                
-                                # Try to read additional signals (may fail for some motors)
-                                signals = {"position": pos, "status": "ok"}
-                                
-                                try:
-                                    signals["velocity"] = self.bus.read("Present_Velocity", motor_name, normalize=False)
-                                except:
-                                    signals["velocity"] = None
-                                
-                                try:
-                                    signals["load"] = self.bus.read("Present_Load", motor_name, normalize=False)
-                                except:
-                                    signals["load"] = None
-                                
-                                try:
-                                    signals["voltage"] = self.bus.read("Present_Voltage", motor_name, normalize=False)
-                                except:
-                                    signals["voltage"] = None
-                                
-                                try:
-                                    signals["temperature"] = self.bus.read("Present_Temperature", motor_name, normalize=False)
-                                except:
-                                    signals["temperature"] = None
-                                
-                                try:
-                                    signals["current"] = self.bus.read("Present_Current", motor_name, normalize=False)
-                                except:
-                                    signals["current"] = None
-                                
-                                try:
-                                    signals["moving"] = self.bus.read("Moving", motor_name, normalize=False)
-                                except:
-                                    signals["moving"] = None
-                                
-                                try:
-                                    signals["goal_position"] = self.bus.read("Goal_Position", motor_name, normalize=True)
-                                except:
-                                    signals["goal_position"] = None
-                                
-                                try:
-                                    signals["torque_enable"] = self.bus.read("Torque_Enable", motor_name, normalize=False)
-                                except:
-                                    signals["torque_enable"] = None
-                                
-                                motor_data[motor_name] = signals
-                            except:
-                                motor_data[motor_name] = {"position": None, "status": "error"}
-                        self.motor_update.emit(motor_data)
+                    gripper_cam = self.cameras.get("gripper")
+                    if gripper_cam and gripper_cam.is_connected:
+                        frame = gripper_cam.read()
+                        if frame is not None and frame.size > 0:
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            frame_resized = cv2.resize(frame_rgb, (320, 240))  # 4:3 for gripper camera
+                            
+                            height, width, channel = frame_resized.shape
+                            bytes_per_line = 3 * width
+                            q_image = QImage(frame_resized.data, width, height, bytes_per_line, QImage.Format_RGB888)
+                            pixmap = QPixmap.fromImage(q_image)
+                            self.gripper_camera_update.emit(pixmap)
                 except Exception as e:
                     pass
                 
-                time.sleep(0.1)  # 10 FPS update rate
+                # Update motors - only every 3rd iteration (reduces bus traffic)
+                # Skip motor reads when paused (during command execution)
+                motor_update_counter += 1
+                if motor_update_counter >= 3 and not self.paused:
+                    motor_update_counter = 0
+                    try:
+                        if self.bus.is_connected:
+                            motor_data = {}
+                            for motor_name in ["shoulder_pan", "shoulder_lift", "elbow_flex", 
+                                             "wrist_flex", "wrist_roll", "gripper"]:
+                                # Skip motors that are having issues (overload, etc.)
+                                if motor_name in motor_skip_count:
+                                    motor_skip_count[motor_name] -= 1
+                                    if motor_skip_count[motor_name] <= 0:
+                                        del motor_skip_count[motor_name]
+                                    motor_data[motor_name] = {"position": None, "status": "skipped"}
+                                    continue
+                                
+                                try:
+                                    # Read position with error handling - use non-blocking read
+                                    try:
+                                        pos = self.bus.read("Present_Position", motor_name, normalize=True, num_retry=0)
+                                        signals = {"position": pos, "status": "ok"}
+                                    except (RuntimeError, ConnectionError) as e:
+                                        error_msg = str(e).lower()
+                                        # Check for overload or other motor errors
+                                        if "overload" in error_msg or "error" in error_msg:
+                                            # Skip this motor for 10 iterations (~1 second)
+                                            motor_skip_count[motor_name] = 10
+                                            motor_data[motor_name] = {"position": None, "status": "overload"}
+                                            continue
+                                        else:
+                                            # Other error - mark but don't skip
+                                            signals = {"position": None, "status": "error"}
+                                    
+                                    # Only read additional signals if position read succeeded
+                                    if signals.get("status") == "ok":
+                                        # Read additional signals less frequently (only critical ones)
+                                        try:
+                                            signals["velocity"] = self.bus.read("Present_Velocity", motor_name, normalize=False, num_retry=0)
+                                        except:
+                                            signals["velocity"] = None
+                                        
+                                        try:
+                                            signals["voltage"] = self.bus.read("Present_Voltage", motor_name, normalize=False, num_retry=0)
+                                        except:
+                                            signals["voltage"] = None
+                                        
+                                        try:
+                                            signals["moving"] = self.bus.read("Moving", motor_name, normalize=False, num_retry=0)
+                                        except:
+                                            signals["moving"] = None
+                                        
+                                        # Optional signals (read less frequently or skip)
+                                        signals["load"] = None
+                                        signals["temperature"] = None
+                                        signals["current"] = None
+                                        signals["goal_position"] = None
+                                        signals["torque_enable"] = None
+                                    
+                                    motor_data[motor_name] = signals
+                                except Exception as e:
+                                    # Catch-all for any other errors
+                                    error_msg = str(e).lower()
+                                    if "overload" in error_msg:
+                                        motor_skip_count[motor_name] = 10
+                                    motor_data[motor_name] = {"position": None, "status": "error"}
+                            self.motor_update.emit(motor_data)
+                    except Exception as e:
+                        # Don't let bus-level errors crash the monitoring loop
+                        pass
+                
+                # Faster camera updates, slower motor updates
+                time.sleep(0.033)  # ~30 FPS for cameras, ~10 FPS effective for motors
                 
         except Exception as e:
             self.status_update.emit(f"❌ Monitoring error: {e}")
@@ -653,8 +742,12 @@ class MonitoringThread(QThread):
             try:
                 if hasattr(self, 'bus'):
                     self.bus.disconnect()
-                if hasattr(self, 'camera'):
-                    self.camera.disconnect()
+                if hasattr(self, 'cameras'):
+                    for camera in self.cameras.values():
+                        try:
+                            camera.disconnect()
+                        except:
+                            pass
             except:
                 pass
     
@@ -664,20 +757,29 @@ class MonitoringThread(QThread):
 
 
 class ChessRobotUILLM(QMainWindow):
-    def __init__(self, port: str, dev_mode: bool = False, api_key: Optional[str] = None):
+    def __init__(self, port: str, dev_mode: bool = False, api_key: Optional[str] = None, workflow_id: Optional[str] = None):
         super().__init__()
         self.port = port
         self.running = False
         self.dev_mode = dev_mode
         self.file_watcher = None
         
-        # Setup LLM
-        self.setup_llm(api_key)
+        # Setup LLM with ChatKit support
+        self.setup_llm(api_key, workflow_id)
         
         # Setup robot and camera
         self.setup_robot()
         self.setup_camera()
         self.setup_kinematics()
+        
+        # Internal position model - tracks current robot state
+        self.position_model = {
+            "joints": {},  # Current joint positions
+            "end_effector": None,  # Current end-effector position (x, y, z)
+            "gripper": 0.0,  # Current gripper state
+            "last_update": None  # Timestamp of last update
+        }
+        self.update_position_model()  # Initialize with current positions
         
         # Create main window - adaptive sizing
         self.setWindowTitle("Chess Robot Monitor - LLM Control Interface")
@@ -871,9 +973,35 @@ class ChessRobotUILLM(QMainWindow):
         self.bus = FeetechMotorsBus(port=self.port, motors=self.all_motors, calibration=calibration)
         
     def setup_camera(self):
-        """Initialize camera connection."""
-        cfg = OpenCVCameraConfig(index_or_path=0, width=640, height=480, fps=30)
-        self.camera = OpenCVCamera(cfg)
+        """Initialize camera connections for dual-camera setup."""
+        # Main camera (iPhone or fixed overhead camera)
+        # For iPhone via USB: use index 1 or 2 (try different indices)
+        # For iPhone via network: use RTSP URL like "rtsp://192.168.x.x:8080/h264_ulaw.sdp"
+        main_camera_cfg = OpenCVCameraConfig(
+            index_or_path=0,  # Change to 1, 2, or RTSP URL for iPhone
+            width=1280,       # Higher resolution for main overview
+            height=720,
+            fps=30
+        )
+        self.main_camera = OpenCVCamera(main_camera_cfg)
+        
+        # Gripper-mounted camera for precision "last mile" control
+        gripper_camera_cfg = OpenCVCameraConfig(
+            index_or_path=1,  # Adjust based on your USB camera index
+            width=640,        # Lower resolution is fine for gripper cam
+            height=480,
+            fps=30
+        )
+        self.gripper_camera = OpenCVCamera(gripper_camera_cfg)
+        
+        # Store in dict for easier management (following lerobot pattern)
+        self.cameras = {
+            "main": self.main_camera,
+            "gripper": self.gripper_camera
+        }
+        
+        # Maintain backwards compatibility with single camera reference
+        self.camera = self.main_camera
     
     def setup_kinematics(self):
         """Initialize robot kinematics for forward kinematics calculations."""
@@ -900,10 +1028,20 @@ class ChessRobotUILLM(QMainWindow):
             print(f"⚠️ Kinematics initialization failed: {e}")
             self.kinematics = None
     
-    def setup_llm(self, api_key: Optional[str] = None):
-        """Initialize LLM client for natural language control."""
+    def setup_llm(self, api_key: Optional[str] = None, workflow_id: Optional[str] = None):
+        """Initialize LLM client using OpenAI ChatKit for natural language control.
+        
+        ChatKit can be used in two ways:
+        1. With workflow_id: Uses OpenAI's hosted Agent Builder workflows via ChatKit sessions
+        2. Without workflow_id: Falls back to direct chat.completions API
+        
+        Note: For full ChatKit server integration, install: pip install openai-chatkit
+        """
         self.llm_client = None
         self.llm_enabled = False
+        self.chatkit_session = None
+        self.workflow_id = workflow_id or os.getenv("OPENAI_CHATKIT_WORKFLOW_ID")
+        self.use_chatkit_workflow = bool(self.workflow_id)
         
         if not LLM_AVAILABLE:
             print("⚠️ LLM support not available - install openai package")
@@ -915,8 +1053,43 @@ class ChessRobotUILLM(QMainWindow):
         if api_key:
             try:
                 self.llm_client = OpenAI(api_key=api_key)
-                self.llm_enabled = True
-                print("✅ LLM client initialized")
+                
+                # Try to use ChatKit workflow if workflow_id is provided
+                if self.workflow_id:
+                    try:
+                        # Attempt to create ChatKit session via OpenAI API
+                        # Note: This API endpoint may vary - checking for chatkit namespace
+                        if hasattr(self.llm_client, 'chatkit') and hasattr(self.llm_client.chatkit, 'sessions'):
+                            self.chatkit_session = self.llm_client.chatkit.sessions.create(
+                                workflow_id=self.workflow_id
+                            )
+                            print(f"✅ ChatKit session created with workflow: {self.workflow_id}")
+                            self.llm_enabled = True
+                        else:
+                            # ChatKit API not available in this SDK version
+                            print(f"⚠️ ChatKit sessions API not available in this OpenAI SDK version")
+                            print(f"   Workflow ID provided: {self.workflow_id}")
+                            print("   Falling back to direct chat.completions")
+                            print("   Note: For full ChatKit support, you may need:")
+                            print("   - A newer version of the openai package, or")
+                            print("   - Use the openai-chatkit package for server integration")
+                            self.use_chatkit_workflow = False
+                            self.llm_enabled = True
+                    except Exception as e:
+                        print(f"⚠️ Failed to create ChatKit session: {e}")
+                        print("   Falling back to direct chat.completions")
+                        self.use_chatkit_workflow = False
+                        self.llm_enabled = True
+                else:
+                    # No workflow_id, use direct chat.completions
+                    print("ℹ️ Using direct chat.completions API")
+                    print("   To use ChatKit workflows, set OPENAI_CHATKIT_WORKFLOW_ID env var or pass --workflow-id")
+                    if CHATKIT_SDK_AVAILABLE:
+                        print("   ✅ ChatKit Python SDK is available (openai-chatkit)")
+                    else:
+                        print("   ℹ️  ChatKit Python SDK not installed (optional for server integration)")
+                    self.llm_enabled = True
+                    
             except Exception as e:
                 print(f"⚠️ Failed to initialize LLM client: {e}")
         else:
@@ -969,68 +1142,81 @@ class ChessRobotUILLM(QMainWindow):
         panels_layout.setSpacing(15)
         panels_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Left column: Camera view
-        self.create_camera_panel(panels_layout)
+        # LEFT COLUMN: Camera and Motors
+        left_column = QVBoxLayout()
+        left_column.setSpacing(15)
+        self.create_camera_panel(left_column)
+        self.create_motor_panel(left_column)
+        panels_layout.addLayout(left_column, 1)  # Left column gets 1 part
         
-        # Right column: Motor status (more space now)
-        self.create_motor_panel(panels_layout)
-        
-        # Give motor panel more space
-        panels_layout.setStretch(0, 1)  # Camera
-        panels_layout.setStretch(1, 2)  # Motors get 2x space
+        # RIGHT COLUMN: Full ChatKit/LLM Control
+        right_column = QVBoxLayout()
+        right_column.setSpacing(15)
+        self.create_llm_panel(right_column)
+        panels_layout.addLayout(right_column, 1)  # Right column gets 1 part (equal split)
         
         main_layout.addLayout(panels_layout, 1)
-        
-        # Bottom row: 3D Robot visualization and LLM panel (give more space to LLM)
-        bottom_layout = QHBoxLayout()
-        bottom_layout.setSpacing(12)
-        bottom_layout.setContentsMargins(0, 0, 0, 0)
-        self.create_robot_3d_panel(bottom_layout)
-        llm_widget = self.create_llm_panel(bottom_layout)
-        # Give LLM panel more space (stretch factor of 2 vs 1 for 3D)
-        bottom_layout.setStretch(0, 1)  # 3D panel
-        bottom_layout.setStretch(1, 2)  # LLM panel gets 2x space
-        main_layout.addLayout(bottom_layout, 1)
         
         # Bottom: Control buttons
         self.create_control_panel(main_layout)
         
     def create_camera_panel(self, parent_layout):
-        """Create camera view panel."""
-        camera_group = QGroupBox("Camera")
-        # Terminal styling applied globally
-        camera_group.setToolTip("Live camera feed")
-        camera_layout = QVBoxLayout(camera_group)
-        camera_layout.setSpacing(8)
-        camera_layout.setContentsMargins(8, 8, 8, 8)
+        """Create dual camera view panels."""
+        # Container for both cameras
+        cameras_container = QWidget()
+        cameras_layout = QVBoxLayout(cameras_container)
+        cameras_layout.setSpacing(8)
+        cameras_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Camera display - terminal style
-        self.camera_label = QLabel("Initializing...")
-        self.camera_label.setAlignment(Qt.AlignCenter)
-        self.camera_label.setMinimumSize(300, 220)
-        self.camera_label.setMaximumSize(420, 320)
-        self.camera_label.setScaledContents(True)
-        camera_layout.addWidget(self.camera_label)
+        # Main camera panel (iPhone/Overview)
+        main_camera_group = QGroupBox("Main Camera [Overview]")
+        main_camera_group.setToolTip("Main overview camera - shows entire chess board and robot setup")
+        main_camera_layout = QVBoxLayout(main_camera_group)
+        main_camera_layout.setSpacing(6)
+        main_camera_layout.setContentsMargins(8, 8, 8, 8)
         
-        # Camera info bar
-        camera_info = QHBoxLayout()
-        camera_info.setSpacing(10)
+        self.main_camera_label = QLabel("Initializing main camera...")
+        self.main_camera_label.setAlignment(Qt.AlignCenter)
+        self.main_camera_label.setMinimumSize(320, 180)
+        self.main_camera_label.setMaximumSize(640, 360)
+        self.main_camera_label.setScaledContents(True)
+        main_camera_layout.addWidget(self.main_camera_label)
         
-        self.fps_label = QLabel("FPS: --")
-        camera_info.addWidget(self.fps_label)
-        camera_info.addStretch()
+        self.main_camera_status = QLabel("[CONNECTING]")
+        self.main_camera_status.setStyleSheet("color: #f0883e;")
+        self.main_camera_status.setAlignment(Qt.AlignCenter)
+        main_camera_layout.addWidget(self.main_camera_status)
         
-        res_label = QLabel("640x480")
-        camera_info.addWidget(res_label)
-        camera_layout.addLayout(camera_info)
+        cameras_layout.addWidget(main_camera_group)
         
-        # Camera status
-        self.camera_status = QLabel("[CONNECTING]")
-        self.camera_status.setStyleSheet("color: #f0883e;")
-        self.camera_status.setAlignment(Qt.AlignCenter)
-        camera_layout.addWidget(self.camera_status)
+        # Gripper camera panel (Last Mile)
+        gripper_camera_group = QGroupBox("Gripper Camera [Last Mile]")
+        gripper_camera_group.setToolTip("Gripper-mounted camera - for precision piece pickup and placement")
+        gripper_camera_layout = QVBoxLayout(gripper_camera_group)
+        gripper_camera_layout.setSpacing(6)
+        gripper_camera_layout.setContentsMargins(8, 8, 8, 8)
         
-        parent_layout.addWidget(camera_group)
+        self.gripper_camera_label = QLabel("Initializing gripper camera...")
+        self.gripper_camera_label.setAlignment(Qt.AlignCenter)
+        self.gripper_camera_label.setMinimumSize(320, 240)
+        self.gripper_camera_label.setMaximumSize(320, 240)
+        self.gripper_camera_label.setScaledContents(True)
+        gripper_camera_layout.addWidget(self.gripper_camera_label)
+        
+        self.gripper_camera_status = QLabel("[CONNECTING]")
+        self.gripper_camera_status.setStyleSheet("color: #f0883e;")
+        self.gripper_camera_status.setAlignment(Qt.AlignCenter)
+        gripper_camera_layout.addWidget(self.gripper_camera_status)
+        
+        cameras_layout.addWidget(gripper_camera_group)
+        
+        # FPS counter for both cameras
+        self.fps_label = QLabel("FPS: Main: -- | Gripper: --")
+        self.fps_label.setStyleSheet("color: #7d8590; font-size: 9pt;")
+        self.fps_label.setAlignment(Qt.AlignCenter)
+        cameras_layout.addWidget(self.fps_label)
+        
+        parent_layout.addWidget(cameras_container)
         
     def create_motor_panel(self, parent_layout):
         """Create motor status panel."""
@@ -1392,6 +1578,38 @@ class ChessRobotUILLM(QMainWindow):
         QShortcut(QKeySequence("F5"), self).activated.connect(self.refresh_status)
         control_layout.addWidget(refresh_btn)
         
+        # Restart button - useful for dev mode
+        restart_btn = QPushButton("RESTART")
+        restart_btn.setToolTip("Restart the application (Ctrl+R)")
+        restart_btn.clicked.connect(self.restart_app)
+        restart_btn.setStyleSheet("""
+            QPushButton {
+                background: #1f6feb;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #388bfd;
+            }
+        """)
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self.restart_app)
+        control_layout.addWidget(restart_btn)
+        
+        # Calibrate button - for chess board calibration
+        calibrate_btn = QPushButton("CALIBRATE BOARD")
+        calibrate_btn.setToolTip("Calibrate chess board positions (Ctrl+B)")
+        calibrate_btn.clicked.connect(self.start_calibration)
+        calibrate_btn.setStyleSheet("""
+            QPushButton {
+                background: #a371f7;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #8957e5;
+            }
+        """)
+        QShortcut(QKeySequence("Ctrl+B"), self).activated.connect(self.start_calibration)
+        control_layout.addWidget(calibrate_btn)
+        
         control_layout.addStretch()
         
         stop_btn = QPushButton("STOP")
@@ -1722,95 +1940,400 @@ class ChessRobotUILLM(QMainWindow):
         self.workspace_top_canvas.update()
     
     def create_llm_panel(self, parent_layout):
-        """Create LLM natural language control panel."""
+        """Create simple, functional LLM control panel."""
         llm_group = QGroupBox("LLM Control")
-        # Terminal-like styling is applied globally, no need for custom styles here
-        llm_group.setToolTip("Control robot using natural language commands. LLM generates motor positions from your instructions.")
         llm_layout = QVBoxLayout(llm_group)
-        llm_layout.setSpacing(12)
-        llm_layout.setContentsMargins(12, 12, 12, 12)
+        llm_layout.setSpacing(10)
+        llm_layout.setContentsMargins(12, 15, 12, 12)
         
-        # Model selection and status row
-        model_status_layout = QHBoxLayout()
-        model_status_layout.setSpacing(10)
-        
-        # Model selection
-        model_label = QLabel("Model:")
-        model_status_layout.addWidget(model_label)
+        # Model selection row
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Model:"))
         
         self.llm_model_combo = QComboBox()
         self.llm_model_combo.addItems([
-            "gpt-4o-mini",
-            "gpt-4o",
-            "gpt-4-turbo",
-            "gpt-3.5-turbo"
+            # Latest GPT-5 models (vision-capable)
+            "gpt-5.1 👁️", "gpt-5-mini 👁️", "gpt-5-nano 👁️",
+            # GPT-4.1 models (vision-capable)  
+            "gpt-4.1 👁️", "gpt-4.1-mini 👁️", "gpt-4.1-nano 👁️",
+            # GPT-4o models (vision-capable)
+            "gpt-4o 👁️", "gpt-4o-mini 👁️",
+            # GPT-4 vision models
+            "gpt-4-turbo 👁️", "gpt-4-vision-preview 👁️",
+            # o-series reasoning models (text-only)
+            "o3", "o4-mini", "o1-preview", "o1-mini",
+            # Legacy (text-only)
+            "gpt-4", "gpt-3.5-turbo"
         ])
-        self.llm_model_combo.setCurrentText("gpt-4o-mini")
         self.llm_model_combo.setMinimumWidth(150)
-        model_status_layout.addWidget(self.llm_model_combo)
-        model_status_layout.addStretch()
+        self.llm_model_combo.currentTextChanged.connect(self.on_model_changed)
+        model_row.addWidget(self.llm_model_combo)
         
-        # LLM status
+        # Reasoning effort selector (for o-series models)
+        model_row.addWidget(QLabel("Reasoning:"))
+        self.reasoning_effort_combo = QComboBox()
+        self.reasoning_effort_combo.addItems(["low", "medium", "high"])
+        self.reasoning_effort_combo.setCurrentText("medium")
+        self.reasoning_effort_combo.setMinimumWidth(100)
+        self.reasoning_effort_combo.setToolTip("Reasoning effort level for o-series models (o1, o3, o4)")
+        model_row.addWidget(self.reasoning_effort_combo)
+        
+        model_row.addStretch()
+        
         self.llm_status = QLabel("[READY]" if self.llm_enabled else "[NOT AVAILABLE]")
-        if self.llm_enabled:
-            self.llm_status.setStyleSheet("color: #3fb950;")  # Green for ready
-        else:
-            self.llm_status.setStyleSheet("color: #f85149;")  # Red for not available
-        self.llm_status.setAlignment(Qt.AlignCenter)
-        model_status_layout.addWidget(self.llm_status)
-        llm_layout.addLayout(model_status_layout)
+        self.llm_status.setStyleSheet(f"color: {'#3fb950' if self.llm_enabled else '#f85149'}; font-weight: bold;")
+        model_row.addWidget(self.llm_status)
+        llm_layout.addLayout(model_row)
+        
+        # Update reasoning effort visibility based on initial model
+        self.on_model_changed(self.llm_model_combo.currentText())
+        
+        # Vision controls
+        vision_frame = QFrame()
+        vision_frame.setStyleSheet("QFrame { background: #161b22; border: 1px solid #30363d; padding: 8px; }")
+        vision_layout = QVBoxLayout(vision_frame)
+        vision_layout.setSpacing(8)
+        vision_layout.setContentsMargins(8, 8, 8, 8)
+        
+        # Vision enable checkbox
+        vision_header = QHBoxLayout()
+        self.vision_enabled_checkbox = QCheckBox("Enable Vision (Send Images to LLM)")
+        self.vision_enabled_checkbox.setChecked(True)
+        self.vision_enabled_checkbox.setToolTip("Include camera images in LLM requests (requires vision-capable model)")
+        self.vision_enabled_checkbox.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        vision_header.addWidget(self.vision_enabled_checkbox)
+        vision_header.addStretch()
+        vision_layout.addLayout(vision_header)
+        
+        # Camera source selection
+        camera_row = QHBoxLayout()
+        camera_row.addWidget(QLabel("Camera:"))
+        self.vision_camera_combo = QComboBox()
+        self.vision_camera_combo.addItems(["Main Camera", "Gripper Camera", "Both Cameras"])
+        self.vision_camera_combo.setCurrentText("Main Camera")
+        self.vision_camera_combo.setToolTip("Select which camera(s) to send to LLM")
+        camera_row.addWidget(self.vision_camera_combo)
+        
+        # Image size selection
+        camera_row.addWidget(QLabel("Resolution:"))
+        self.vision_size_combo = QComboBox()
+        self.vision_size_combo.addItems(["512x512", "768x768", "1024x1024", "Original"])
+        self.vision_size_combo.setCurrentText("768x768")
+        self.vision_size_combo.setToolTip("Image resolution sent to LLM (lower = faster/cheaper)")
+        camera_row.addWidget(self.vision_size_combo)
+        camera_row.addStretch()
+        vision_layout.addLayout(camera_row)
+        
+        # Auto-update controls
+        auto_row = QHBoxLayout()
+        self.vision_auto_checkbox = QCheckBox("Auto-update")
+        self.vision_auto_checkbox.setChecked(False)
+        self.vision_auto_checkbox.setToolTip("Periodically send images to LLM for analysis")
+        auto_row.addWidget(self.vision_auto_checkbox)
+        
+        auto_row.addWidget(QLabel("Every:"))
+        self.vision_interval_spin = QSpinBox()
+        self.vision_interval_spin.setRange(1, 60)  # Allow 1-60 seconds (was 5-60)
+        self.vision_interval_spin.setValue(5)  # Default to 5 seconds (was 10)
+        self.vision_interval_spin.setSuffix(" sec")
+        self.vision_interval_spin.setEnabled(False)
+        self.vision_auto_checkbox.toggled.connect(self.vision_interval_spin.setEnabled)
+        self.vision_auto_checkbox.toggled.connect(self.toggle_vision_auto_update)
+        auto_row.addWidget(self.vision_interval_spin)
+        auto_row.addStretch()
+        vision_layout.addLayout(auto_row)
+        
+        # Vision status indicator
+        self.vision_status_label = QLabel("📷 Vision ready")
+        self.vision_status_label.setStyleSheet("color: #58a6ff; font-size: 9pt;")
+        vision_layout.addWidget(self.vision_status_label)
+        
+        llm_layout.addWidget(vision_frame)
+        
+        # Initialize vision auto-update timer
+        self.vision_auto_timer = QTimer()
+        self.vision_auto_timer.timeout.connect(self.vision_auto_update)
         
         # Command input
-        command_label = QLabel("> Command:")
-        llm_layout.addWidget(command_label)
-        
+        llm_layout.addWidget(QLabel("Command:"))
         self.llm_command_input = QPlainTextEdit()
-        self.llm_command_input.setPlaceholderText("Enter command... (e.g., move arm to e2)")
-        self.llm_command_input.setMinimumHeight(80)
+        self.llm_command_input.setPlaceholderText("Enter command (e.g., 'move arm to e2')")
+        self.llm_command_input.setFixedHeight(80)
         llm_layout.addWidget(self.llm_command_input)
         
         # Execute button
-        execute_btn = QPushButton("EXECUTE")
+        execute_btn = QPushButton("Execute")
         execute_btn.setEnabled(self.llm_enabled)
-        execute_btn.clicked.connect(self.execute_llm_command)
+        execute_btn.clicked.connect(self._start_llm_execution_thread)
+        execute_btn.setStyleSheet("""
+            QPushButton {
+                background: #238636;
+                color: white;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #2ea043; }
+            QPushButton:disabled { background: #21262d; color: #6e7681; }
+        """)
         llm_layout.addWidget(execute_btn)
         
-        # LLM Reasoning/Explanation display (larger, more prominent)
-        reasoning_label = QLabel("> Reasoning:")
-        llm_layout.addWidget(reasoning_label)
-        
+        # Response sections with scroll areas
+        # Reasoning
+        llm_layout.addWidget(QLabel("Reasoning:"))
         self.llm_reasoning_display = QTextEdit()
         self.llm_reasoning_display.setReadOnly(True)
         self.llm_reasoning_display.setPlaceholderText("LLM reasoning will appear here...")
-        self.llm_reasoning_display.setStyleSheet("color: #f0883e;")  # Orange for reasoning
-        self.llm_reasoning_display.setMinimumHeight(150)
-        llm_layout.addWidget(self.llm_reasoning_display, 2)  # Give it stretch factor of 2
+        self.llm_reasoning_display.setStyleSheet("color: #f0883e;")
+        llm_layout.addWidget(self.llm_reasoning_display, 2)  # More stretch
         
-        # LLM response display (full JSON)
-        response_label = QLabel("> Response (JSON):")
+        # JSON Response (collapsible)
+        response_label = QLabel("Full Response (JSON):")
+        response_label.setStyleSheet("color: #8b949e; margin-top: 8px;")
         llm_layout.addWidget(response_label)
         
         self.llm_response_display = QTextEdit()
         self.llm_response_display.setReadOnly(True)
-        self.llm_response_display.setStyleSheet("color: #8b949e;")  # Gray for JSON
-        self.llm_response_display.setMinimumHeight(120)
-        llm_layout.addWidget(self.llm_response_display, 1)
+        self.llm_response_display.setPlaceholderText("JSON response will appear here...")
+        self.llm_response_display.setStyleSheet("color: #8b949e;")
+        self.llm_response_display.setMaximumHeight(150)
+        llm_layout.addWidget(self.llm_response_display)
         
-        # Action preview
-        preview_label = QLabel("> Action (Validated):")
-        llm_layout.addWidget(preview_label)
+        # Action Preview
+        action_label = QLabel("Validated Action:")
+        action_label.setStyleSheet("color: #58a6ff; margin-top: 8px;")
+        llm_layout.addWidget(action_label)
         
         self.llm_action_preview = QTextEdit()
         self.llm_action_preview.setReadOnly(True)
-        self.llm_action_preview.setStyleSheet("color: #58a6ff;")  # Blue for action
-        self.llm_action_preview.setMinimumHeight(100)
+        self.llm_action_preview.setPlaceholderText("Validated action will appear here...")
+        self.llm_action_preview.setStyleSheet("color: #58a6ff;")
         llm_layout.addWidget(self.llm_action_preview, 1)
         
         parent_layout.addWidget(llm_group)
-        return llm_group  # Return widget for stretch factor setting
+        return llm_group
     
-    def execute_llm_command(self):
-        """Execute LLM command and control robot."""
+    def on_model_changed(self, model_name):
+        """Show/hide reasoning effort selector based on model type."""
+        # Clean model name (remove vision icon)
+        clean_model = model_name.replace(" 👁️", "").strip()
+        
+        # Reasoning effort is only for o-series models
+        is_reasoning_model = clean_model.startswith("o1") or clean_model.startswith("o3") or clean_model.startswith("o4")
+        self.reasoning_effort_combo.setVisible(is_reasoning_model)
+        # Also update the label visibility
+        for i in range(self.reasoning_effort_combo.parent().layout().count()):
+            item = self.reasoning_effort_combo.parent().layout().itemAt(i)
+            if item and item.widget() and isinstance(item.widget(), QLabel):
+                if item.widget().text() == "Reasoning:":
+                    item.widget().setVisible(is_reasoning_model)
+        
+        # Update vision status based on model capabilities
+        vision_capable = "👁️" in model_name or any(x in clean_model.lower() for x in ['gpt-4o', 'gpt-4-turbo', 'vision', 'gpt-5', 'gpt-4.1'])
+        if hasattr(self, 'vision_enabled_checkbox'):
+            if not vision_capable and self.vision_enabled_checkbox.isChecked():
+                self.vision_status_label.setText("⚠️ Selected model may not support vision")
+                self.vision_status_label.setStyleSheet("color: #f0883e; font-size: 9pt;")
+            elif vision_capable:
+                self.vision_status_label.setText("📷 Vision ready (capable model)")
+                self.vision_status_label.setStyleSheet("color: #3fb950; font-size: 9pt;")
+            else:
+                self.vision_status_label.setText("📷 Vision ready")
+                self.vision_status_label.setStyleSheet("color: #58a6ff; font-size: 9pt;")
+    
+    def capture_camera_image(self, camera_source="main"):
+        """Capture current frame from specified camera and encode to base64.
+        
+        Args:
+            camera_source: "main", "gripper", or "both"
+        
+        Returns:
+            str or list: Base64 encoded image(s)
+        """
+        try:
+            # Get target resolution
+            resolution = self.vision_size_combo.currentText()
+            if resolution == "Original":
+                target_size = None
+            else:
+                # Parse resolution (e.g., "768x768" -> (768, 768))
+                w, h = map(int, resolution.split('x'))
+                target_size = (w, h)
+            
+            def encode_frame(camera):
+                """Helper to encode a single camera frame."""
+                if not camera or not camera.is_connected:
+                    return None
+                
+                frame = camera.read()
+                if frame is None:
+                    return None
+                
+                # Resize if needed
+                if target_size:
+                    frame = cv2.resize(frame, target_size)
+                
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Encode to JPEG
+                _, buffer = cv2.imencode('.jpg', frame_rgb, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                
+                # Convert to base64
+                img_base64 = base64.b64encode(buffer).decode('utf-8')
+                return img_base64
+            
+            # Capture based on selection
+            if camera_source == "main":
+                return encode_frame(self.main_camera)
+            elif camera_source == "gripper":
+                return encode_frame(self.gripper_camera)
+            elif camera_source == "both":
+                main_img = encode_frame(self.main_camera)
+                gripper_img = encode_frame(self.gripper_camera)
+                return [main_img, gripper_img] if main_img and gripper_img else None
+            
+        except Exception as e:
+            print(f"⚠️ Failed to capture camera image: {e}")
+            return None
+    
+    def toggle_vision_auto_update(self, enabled):
+        """Toggle periodic vision updates."""
+        if enabled:
+            interval_sec = self.vision_interval_spin.value()
+            self.vision_auto_timer.start(interval_sec * 1000)
+            self.vision_status_label.setText(f"📷 Auto-updating every {interval_sec}s")
+            print(f"✅ Vision auto-update enabled ({interval_sec}s)")
+        else:
+            self.vision_auto_timer.stop()
+            self.vision_status_label.setText("📷 Vision ready")
+            print("⏸️ Vision auto-update disabled")
+    
+    def vision_auto_update(self):
+        """Periodically analyze scene with LLM (auto-update mode)."""
+        if not self.llm_enabled or not self.vision_enabled_checkbox.isChecked():
+            return
+        
+        try:
+            # Capture image
+            camera_source = self.vision_camera_combo.currentText().split()[0].lower()  # "Main Camera" -> "main"
+            image_data = self.capture_camera_image(camera_source)
+            
+            if image_data:
+                # Build a scene analysis prompt
+                prompt = "Analyze the current scene. What pieces are visible? What is the board state? Any recommendations?"
+                
+                # Send to LLM for analysis (without executing actions)
+                self.vision_status_label.setText("📷 Analyzing scene...")
+                self.vision_status_label.setStyleSheet("color: #f0883e; font-size: 9pt;")
+                
+                # Use simplified analysis (won't execute robot actions)
+                self._analyze_scene_with_vision(prompt, image_data)
+                
+                self.vision_status_label.setText("📷 Auto-updating")
+                self.vision_status_label.setStyleSheet("color: #3fb950; font-size: 9pt;")
+            
+        except Exception as e:
+            print(f"⚠️ Vision auto-update error: {e}")
+            self.vision_status_label.setText("⚠️ Vision update failed")
+            self.vision_status_label.setStyleSheet("color: #f85149; font-size: 9pt;")
+    
+    def _analyze_scene_with_vision(self, prompt, image_data):
+        """Send vision request to LLM for scene analysis (non-blocking)."""
+        # This is a simplified version that just analyzes without robot control
+        # The full implementation will be in execute_llm_command
+        try:
+            selected_model = self.llm_model_combo.currentText()
+            
+            # Build vision message
+            messages = [
+                {"role": "system", "content": "You are a chess assistant. Analyze the chess board and provide insights."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt}
+                ]}
+            ]
+            
+            # Add image(s)
+            if isinstance(image_data, list):
+                # Multiple images
+                for img in image_data:
+                    if img:
+                        messages[1]["content"].append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img}"}
+                        })
+            else:
+                # Single image
+                if image_data:
+                    messages[1]["content"].append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}
+                    })
+            
+            # Send to LLM (simplified - just for analysis)
+            # Use max_completion_tokens for o-series models, max_tokens for others
+            is_reasoning_model = selected_model.startswith("o1") or selected_model.startswith("o3") or selected_model.startswith("o4")
+            api_params = {"model": selected_model, "messages": messages}
+            if is_reasoning_model:
+                api_params["max_completion_tokens"] = 500
+            else:
+                api_params["max_tokens"] = 500
+            response = self.llm_client.chat.completions.create(**api_params)
+            
+            analysis = response.choices[0].message.content
+            print(f"🔍 Scene Analysis: {analysis[:200]}...")
+            
+        except Exception as e:
+            print(f"⚠️ Scene analysis failed: {e}")
+    
+    def _quick_vision_analysis(self, prompt: str, image_data) -> Optional[str]:
+        """Quick vision analysis for feedback loop - returns analysis text."""
+        try:
+            if not self.llm_enabled or not self.llm_client:
+                return None
+            
+            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
+            
+            # Build vision message
+            user_content = [{"type": "text", "text": prompt}]
+            
+            # Add image
+            if isinstance(image_data, list):
+                for img in image_data:
+                    if img:
+                        user_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "low"}  # Low detail for speed
+                        })
+            else:
+                if image_data:
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}", "detail": "low"}
+                    })
+            
+            messages = [
+                {"role": "system", "content": "You are analyzing a chess board scene. Provide brief, actionable feedback about what you see."},
+                {"role": "user", "content": user_content}
+            ]
+            
+            # Quick analysis with lower token limit for speed
+            # Use max_completion_tokens for o-series models, max_tokens for others
+            is_reasoning_model = selected_model.startswith("o1") or selected_model.startswith("o3") or selected_model.startswith("o4")
+            api_params = {"model": selected_model, "messages": messages}
+            if is_reasoning_model:
+                api_params["max_completion_tokens"] = 200
+            else:
+                api_params["max_tokens"] = 200
+            response = self.llm_client.chat.completions.create(**api_params)
+            
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            print(f"⚠️ Quick vision analysis failed: {e}")
+            return None
+    
+    def _start_llm_execution_thread(self):
+        """Start LLM execution in background thread to prevent UI blocking."""
         if not self.llm_enabled or not self.llm_client:
             self.status_bar.setText("❌ LLM not available")
             return
@@ -1820,131 +2343,725 @@ class ChessRobotUILLM(QMainWindow):
             self.status_bar.setText("⚠️ Please enter a command")
             return
         
-        self.status_bar.setText("🤖 Processing LLM command...")
-        self.llm_response_display.setText("Processing...")
-        self.llm_reasoning_display.setText("Processing...")
+        # Stop any existing execution thread
+        if hasattr(self, 'execution_thread') and self.execution_thread and self.execution_thread.isRunning():
+            self.execution_thread.running = False
+            self.execution_thread.wait(1000)  # Wait up to 1 second
+        
+        # Disable execute button during execution
+        self.llm_command_input.setEnabled(False)
+        
+        # Initialize UI
+        self.status_bar.setText("🎯 Starting goal-driven execution...")
+        self.llm_response_display.setText("Initializing...")
+        self.llm_reasoning_display.setText(f"Goal: {command}\n\nStarting iterative execution...\n")
         self.llm_action_preview.setText("")
         
-        try:
-            # Get current robot state
-            current_positions = {}
-            for motor_name in self.all_motors.keys():
-                try:
-                    pos = self.bus.read("Present_Position", motor_name, normalize=True)
-                    current_positions[motor_name] = pos
-                except:
-                    current_positions[motor_name] = 0
-            
-            # Get selected model
-            selected_model = self.llm_model_combo.currentText()
-            
-            # Build prompt for LLM
-            prompt = self._build_llm_prompt(command, current_positions)
-            
-            # Call LLM
-            response = self.llm_client.chat.completions.create(
-                model=selected_model,
-                messages=[
-                    {"role": "system", "content": "You are a robot control assistant. Provide detailed reasoning for your actions. Output only valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.3  # Lower temperature for more consistent outputs
-            )
-            
-            # Parse response
-            llm_output = json.loads(response.choices[0].message.content)
-            
-            # Display full response
-            self.llm_response_display.setText(json.dumps(llm_output, indent=2))
-            
-            # Display reasoning/explanation prominently
-            explanation = llm_output.get("explanation", "No explanation provided")
-            reasoning_text = f"{explanation}\n\n"
-            
-            # Add reasoning about motor changes if available
-            action = llm_output.get("action", {})
-            if action:
-                reasoning_text += "Motor Changes:\n"
-                for motor_key, value in action.items():
-                    motor_name = motor_key.replace(".pos", "")
-                    current = current_positions.get(motor_name, 0)
-                    change = value - current
-                    reasoning_text += f"  • {motor_name}: {current:.1f}° → {value:.1f}° (Δ{change:+.1f}°)\n"
-            
-            self.llm_reasoning_display.setText(reasoning_text)
-            
-            # Validate and execute
-            safe_action = self._validate_llm_action(action, current_positions)
-            
-            if safe_action:
-                self.llm_action_preview.setText(json.dumps(safe_action, indent=2))
-                self._execute_llm_action(safe_action)
-                self.status_bar.setText(f"✅ LLM command executed successfully (using {selected_model})")
+        # Create and start execution thread
+        self.execution_thread = LLMExecutionThread(self, command)
+        self.execution_thread.status_update.connect(self.status_bar.setText)
+        self.execution_thread.reasoning_update.connect(self.llm_reasoning_display.setText)
+        self.execution_thread.response_update.connect(self.llm_response_display.setText)
+        self.execution_thread.action_preview_update.connect(self.llm_action_preview.setText)
+        self.execution_thread.finished_signal.connect(self._on_execution_finished)
+        self.execution_thread.start()
+    
+    def _on_execution_finished(self, success: bool, message: str):
+        """Called when execution thread finishes."""
+        self.llm_command_input.setEnabled(True)  # Re-enable input
+        if not success:
+            self.status_bar.setText(f"❌ {message}")
+    
+    def execute_llm_command(self):
+        """Backward compatibility - redirects to thread-based execution."""
+        self._start_llm_execution_thread()
+    
+    def _execute_llm_command_internal(self, command: str, thread: Optional[LLMExecutionThread] = None):
+        """Internal execution method - can be called from thread or directly."""
+        # Helper to emit updates (works with or without thread)
+        def emit_status(msg):
+            if thread:
+                thread.status_update.emit(msg)
             else:
-                self.status_bar.setText("❌ LLM action failed validation")
-                self.llm_action_preview.setText("Action validation failed - unsafe values detected")
-                self.llm_reasoning_display.setText(
-                    self.llm_reasoning_display.toPlainText() + 
-                    "\n\n⚠️ VALIDATION FAILED: Action was rejected for safety reasons."
+                self.status_bar.setText(msg)
+        
+        def emit_reasoning(msg):
+            if thread:
+                thread.reasoning_update.emit(msg)
+            else:
+                self.llm_reasoning_display.setText(msg)
+        
+        def emit_response(msg):
+            if thread:
+                thread.response_update.emit(msg)
+            else:
+                self.llm_response_display.setText(msg)
+        
+        def emit_action_preview(msg):
+            if thread:
+                thread.action_preview_update.emit(msg)
+            else:
+                self.llm_action_preview.setText(msg)
+        
+        if not self.llm_enabled or not self.llm_client:
+            emit_status("❌ LLM not available")
+            if thread:
+                thread.finished_signal.emit(False, "LLM not available")
+            return
+        
+        # Initialize goal-driven loop
+        emit_status("🎯 Starting goal-driven execution...")
+        emit_response("Initializing...")
+        emit_reasoning(f"Goal: {command}\n\nStarting iterative execution...\n")
+        emit_action_preview("")
+        
+        # PAUSE monitoring thread to avoid port conflicts during command execution
+        if hasattr(self, 'monitor_thread') and self.monitor_thread:
+            self.monitor_thread.paused = True
+            time.sleep(0.2)  # Wait for current read to complete
+            print("⏸️ Monitoring paused for command execution")
+        
+        # Track iteration history
+        iteration_history = []
+        max_iterations = 10  # Safety limit
+        iteration = 0
+        consecutive_failures = 0  # Track repeated failures to detect stuck state
+        last_action_hash = None  # Track if we're repeating the same action
+        movement_history = []  # Track recent movements to detect repeated large movements
+        
+        try:
+            while iteration < max_iterations:
+                if thread and not thread.running:
+                    break  # Thread was stopped
+                
+                iteration += 1
+                emit_status(f"🔄 Iteration {iteration}/{max_iterations}: Planning next action...")
+                
+                # Get current robot state
+                self.update_position_model()
+                current_positions = {}
+                for motor_name in self.all_motors.keys():
+                    try:
+                        pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                        current_positions[motor_name] = pos
+                    except:
+                        current_positions[motor_name] = self.position_model["joints"].get(motor_name, 0)
+                
+                # Capture current image
+                image_data = None
+                if self.vision_enabled_checkbox.isChecked():
+                    camera_source = self.vision_camera_combo.currentText().split()[0].lower()
+                    image_data = self.capture_camera_image(camera_source)
+                
+                # Build context-aware prompt with iteration history
+                iteration_context = self._build_iteration_context(command, current_positions, iteration, iteration_history)
+                
+                # Get LLM's next action
+                llm_output = self._get_llm_action(iteration_context, image_data, current_positions)
+                
+                if not llm_output:
+                    emit_status(f"❌ Iteration {iteration}: LLM failed to respond")
+                    if thread:
+                        thread.finished_signal.emit(False, f"Iteration {iteration}: LLM failed to respond")
+                    break
+                
+                # Display what LLM wants to do
+                explanation = llm_output.get("explanation", "")
+                # Get current reasoning text
+                if thread:
+                    # For thread, we need to append - store in a variable that accumulates
+                    if not hasattr(thread, '_reasoning_text'):
+                        thread._reasoning_text = f"Goal: {command}\n\nStarting iterative execution...\n"
+                    thread._reasoning_text += f"\n\n--- Iteration {iteration} ---\n{explanation}\n"
+                    emit_reasoning(thread._reasoning_text)
+                else:
+                    current_reasoning = self.llm_reasoning_display.toPlainText()
+                    emit_reasoning(current_reasoning + f"\n\n--- Iteration {iteration} ---\n{explanation}\n")
+                
+                # Display full response
+                emit_response(json.dumps(llm_output, indent=2))
+                
+                # Execute the action
+                sequence = llm_output.get("sequence", None)
+                action = llm_output.get("action", {})
+                
+                executed = False
+                execution_error = None
+                
+                try:
+                    if sequence:
+                        executed = self._execute_llm_sequence(sequence, current_positions, original_command=command)
+                        if not executed:
+                            execution_error = "Sequence stopped (likely due to overload)"
+                    elif action:
+                        safe_action = self._validate_llm_action(action, current_positions)
+                        if safe_action:
+                            self._execute_llm_action(safe_action)
+                            executed = True
+                        else:
+                            execution_error = "Action failed validation"
+                except RuntimeError as e:
+                    # Overload error from _execute_llm_action
+                    if "overload" in str(e).lower():
+                        execution_error = "Motor overload detected"
+                        executed = False
+                    else:
+                        raise
+                
+                if not executed:
+                    error_msg = execution_error or "Action execution failed"
+                    emit_status(f"⚠️ Iteration {iteration}: {error_msg}")
+                    iteration_history.append({"iteration": iteration, "status": "execution_failed", "action": llm_output, "error": error_msg})
+                    consecutive_failures += 1
+                    
+                    # If overload detected, add extra cool-down pause
+                    if "overload" in error_msg.lower():
+                        emit_status(f"⏸️ Overload detected - pausing 3 seconds before retry...")
+                        time.sleep(3.0)
+                    
+                    # Stop if too many consecutive failures
+                    if consecutive_failures >= 3:
+                        emit_status(f"❌ Stopped: {consecutive_failures} consecutive failures")
+                        current_reasoning = thread._reasoning_text if thread and hasattr(thread, '_reasoning_text') else ""
+                        emit_reasoning(
+                            current_reasoning + 
+                            f"\n\n❌ Stopped after {consecutive_failures} consecutive failures. Robot may be stuck or overloaded."
+                        )
+                        if thread:
+                            thread.finished_signal.emit(False, f"{consecutive_failures} consecutive failures")
+                        break
+                    continue
+                else:
+                    consecutive_failures = 0  # Reset on success
+                
+                # Wait for action to complete
+                time.sleep(1.0)
+                
+                # Check if positions actually changed (stuck detection)
+                new_positions = {}
+                for motor_name in self.all_motors.keys():
+                    try:
+                        pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                        new_positions[motor_name] = pos
+                    except:
+                        new_positions[motor_name] = current_positions.get(motor_name, 0)
+                
+                # Calculate position change
+                total_change = sum(abs(new_positions.get(m, 0) - current_positions.get(m, 0)) 
+                                  for m in self.all_motors.keys())
+                
+                # Track movement history (last 3 iterations)
+                movement_history.append(total_change)
+                if len(movement_history) > 3:
+                    movement_history.pop(0)
+                
+                # Detect repeated large movements (could cause overheating)
+                if len(movement_history) >= 2:
+                    recent_large_movements = sum(1 for m in movement_history[-2:] if m > 15.0)
+                    if recent_large_movements >= 2:
+                        emit_status(f"⚠️ Multiple large movements detected - adding cool-down pause...")
+                        current_reasoning = thread._reasoning_text if thread and hasattr(thread, '_reasoning_text') else ""
+                        emit_reasoning(
+                            current_reasoning + 
+                            f"\n⚠️ Multiple large movements detected (last 2: {movement_history[-2]:.1f}°, {movement_history[-1]:.1f}°) - pausing 2s for motor safety\n"
+                        )
+                        time.sleep(2.0)  # Cool-down pause
+                
+                if total_change < 2.0:  # Less than 2 degrees total change = stuck
+                    consecutive_failures += 1
+                    current_reasoning = thread._reasoning_text if thread and hasattr(thread, '_reasoning_text') else ""
+                    emit_reasoning(
+                        current_reasoning + 
+                        f"\n⚠️ Robot barely moved (Δ={total_change:.1f}°) - may be stuck or overloaded\n"
+                    )
+                
+                # Check if goal is reached
+                goal_reached, completion_feedback = self._check_goal_completion(
+                    command, new_positions, image_data, action_executed=True, position_change=total_change  # Use updated positions
                 )
                 
-        except json.JSONDecodeError as e:
-            self.status_bar.setText(f"❌ Invalid JSON from LLM: {e}")
-            self.llm_response_display.setText(f"Error: Invalid JSON response\n{response.choices[0].message.content if 'response' in locals() else 'No response'}")
+                # Record iteration
+                iteration_history.append({
+                    "iteration": iteration,
+                    "action": llm_output,
+                    "goal_reached": goal_reached,
+                    "feedback": completion_feedback,
+                    "position_change": total_change
+                })
+                
+                # Update display
+                current_reasoning = thread._reasoning_text if thread and hasattr(thread, '_reasoning_text') else ""
+                emit_reasoning(
+                    current_reasoning + 
+                    f"\n✅ Action executed (moved {total_change:.1f}°)\n🎯 Goal status: {'REACHED' if goal_reached else 'NOT YET REACHED'}\n"
+                    f"Feedback: {completion_feedback}\n"
+                )
+                if thread and hasattr(thread, '_reasoning_text'):
+                    thread._reasoning_text = current_reasoning + f"\n✅ Action executed (moved {total_change:.1f}°)\n🎯 Goal status: {'REACHED' if goal_reached else 'NOT YET REACHED'}\nFeedback: {completion_feedback}\n"
+                
+                if goal_reached:
+                    emit_status(f"✅ Goal achieved in {iteration} iteration(s)!")
+                    current_reasoning = thread._reasoning_text if thread and hasattr(thread, '_reasoning_text') else ""
+                    emit_reasoning(
+                        current_reasoning + 
+                        f"\n\n🎉 SUCCESS! Goal '{command}' has been achieved!\n"
+                    )
+                    if thread:
+                        thread.finished_signal.emit(True, f"Goal achieved in {iteration} iteration(s)")
+                    break
+                else:
+                    # Continue loop - LLM will plan next action
+                    emit_status(f"🔄 Iteration {iteration} complete. Goal not yet reached. Planning next action...")
+                    # Add delay between iterations to prevent motor overheating
+                    # Longer delay if we just made a large movement
+                    if total_change > 15.0:
+                        time.sleep(2.0)  # Longer pause after large movements
+                    else:
+                        time.sleep(1.0)  # Standard pause between iterations
+            
+            if iteration >= max_iterations:
+                emit_status(f"⚠️ Reached max iterations ({max_iterations}). Goal may not be fully achieved.")
+                current_reasoning = thread._reasoning_text if thread and hasattr(thread, '_reasoning_text') else ""
+                emit_reasoning(
+                    current_reasoning + 
+                    f"\n\n⚠️ Stopped after {max_iterations} iterations. Goal may require more steps."
+                )
+                if thread:
+                    thread.finished_signal.emit(False, f"Reached max iterations ({max_iterations})")
+                
         except Exception as e:
-            self.status_bar.setText(f"❌ LLM error: {str(e)[:50]}...")
-            self.llm_response_display.setText(f"Error: {str(e)}")
+            emit_status(f"❌ Goal-driven execution error: {str(e)[:50]}...")
+            current_reasoning = thread._reasoning_text if thread and hasattr(thread, '_reasoning_text') else ""
+            emit_reasoning(
+                current_reasoning + 
+                f"\n\n❌ Error: {str(e)}"
+            )
+            import traceback
+            traceback.print_exc()
+            if thread:
+                thread.finished_signal.emit(False, f"Error: {str(e)}")
+        finally:
+            # RESUME monitoring thread after command execution
+            if hasattr(self, 'monitor_thread') and self.monitor_thread:
+                self.monitor_thread.paused = False
+                print("▶️ Monitoring resumed")
     
-    def _build_llm_prompt(self, command: str, current_positions: Dict[str, float]) -> str:
-        """Build prompt for LLM with robot context."""
-        prompt = f"""You control a 5-DOF robot arm for chess piece manipulation.
+    def _build_iteration_context(self, original_command: str, current_positions: Dict[str, float], 
+                                  iteration: int, history: List[Dict]) -> str:
+        """Build context for LLM including iteration history and current state."""
+        # Get current square if available
+        current_square = None
+        if "shoulder_pan" in current_positions and "shoulder_lift" in current_positions:
+            current_square = self.calculate_robot_square(
+                current_positions["shoulder_pan"],
+                current_positions["shoulder_lift"]
+            )
+        
+        # Get board info
+        board_info = self.get_chess_board_info()
+        board_context = ""
+        if board_info:
+            board_context = f"\nChess Board: Calibrated, current square: {current_square if current_square else 'unknown'}"
+        
+        # Build history summary
+        history_text = ""
+        if history:
+            history_text = "\n\nPrevious iterations:\n"
+            for h in history[-3:]:  # Last 3 iterations
+                hist_iter = h.get("iteration", 0)
+                hist_feedback = h.get("feedback", "")
+                history_text += f"  Iteration {hist_iter}: {hist_feedback[:100]}...\n"
+        
+        context = f"""GOAL-DRIVEN EXECUTION - Iteration {iteration}
 
-Available motors:
-- shoulder_pan: horizontal rotation (degrees, range: -180 to 180)
-- shoulder_lift: vertical lift (degrees, range: -90 to 90)
-- elbow_flex: elbow bend (degrees, range: -90 to 90)
-- wrist_flex: wrist bend (degrees, range: -90 to 90)
-- gripper: open/close (0-100%, 0=open, 100=closed)
+ORIGINAL GOAL: {original_command}
 
-Current motor positions:
-{json.dumps(current_positions, indent=2)}
+CURRENT STATE:
+- Joint positions: {json.dumps(current_positions, indent=2)}
+- Current square: {current_square if current_square else "unknown"}
+{board_context}
+{history_text}
 
-User command: {command}
+YOUR TASK:
+Based on the goal and current state, determine what action to take NEXT.
+- If goal is not yet achieved, plan the next step toward the goal
+- If you're close but not quite there, make a small adjustment
+- If you need to see more, move to overview position first
+- Keep actions incremental and safe
 
-Output a JSON object with this structure:
+Output either a single action or a short sequence (1-3 steps max per iteration).
+"""
+        return context
+    
+    def _get_llm_action(self, context: str, image_data, current_positions: Dict[str, float]) -> Optional[Dict]:
+        """Get next action from LLM given context."""
+        try:
+            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
+            
+            # Build prompt with context
+            base_prompt = self._build_llm_prompt("", current_positions)  # Get base prompt structure
+            # Replace the command part with our iteration context
+            full_prompt = base_prompt.replace('User command: ""', f'Iteration Context:\n{context}')
+            
+            # Build messages
+            if image_data:
+                user_content = [{"type": "text", "text": full_prompt}]
+                if isinstance(image_data, list):
+                    for img in image_data:
+                        if img:
+                            user_content.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "high"}
+                            })
+                else:
+                    if image_data:
+                        user_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_data}", "detail": "high"}
+                        })
+                
+                messages = [
+                    {"role": "system", "content": "You are a robot control assistant. Analyze the current state and plan the next action toward the goal. Output only valid JSON."},
+                    {"role": "user", "content": user_content}
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": "You are a robot control assistant. Analyze the current state and plan the next action toward the goal. Output only valid JSON."},
+                    {"role": "user", "content": full_prompt}
+                ]
+            
+            # Call LLM
+            is_reasoning_model = selected_model.startswith("o1") or selected_model.startswith("o3") or selected_model.startswith("o4")
+            
+            api_params = {
+                "model": selected_model,
+                "messages": messages
+            }
+            
+            if not is_reasoning_model:
+                api_params["response_format"] = {"type": "json_object"}
+                if not selected_model.startswith("gpt-5"):
+                    api_params["temperature"] = 0.3
+            else:
+                api_params["reasoning_effort"] = self.reasoning_effort_combo.currentText()
+            
+            response = self.llm_client.chat.completions.create(**api_params)
+            response_content = response.choices[0].message.content
+            return json.loads(response_content)
+            
+        except Exception as e:
+            print(f"⚠️ LLM action request failed: {e}")
+            return None
+    
+    def _check_goal_completion(self, command: str, current_positions: Dict[str, float], 
+                                image_data, action_executed: bool, position_change: float) -> Tuple[bool, str]:
+        """Goal completion judge - determines if goal has been reached.
+        
+        Returns: (goal_reached: bool, feedback: str)
+        """
+        try:
+            # Update position model
+            self.update_position_model()
+            
+            # If nothing was executed, don't declare success
+            if not action_executed:
+                return False, "No action executed yet"
+            
+            # If almost no movement, don't declare success
+            if position_change < 1.0:
+                return False, f"Insufficient movement (Δ={position_change:.1f}°); continuing"
+            
+            # Get current square
+            current_square = None
+            if "shoulder_pan" in current_positions and "shoulder_lift" in current_positions:
+                current_square = self.calculate_robot_square(
+                    current_positions["shoulder_pan"],
+                    current_positions["shoulder_lift"]
+                )
+            
+            # Use LLM as goal completion judge if vision is available
+            if image_data and self.llm_enabled:
+                return self._llm_goal_judge(command, current_positions, current_square, image_data)
+            else:
+                # Rule-based judge (fallback)
+                return self._rule_based_goal_judge(command, current_positions, current_square)
+                
+        except Exception as e:
+            print(f"⚠️ Goal completion check failed: {e}")
+            return False, f"Error checking goal: {e}"
+    
+    def _llm_goal_judge(self, command: str, current_positions: Dict[str, float], 
+                        current_square: Optional[str], image_data) -> Tuple[bool, str]:
+        """LLM-based goal completion judge - analyzes scene to determine if goal is reached."""
+        try:
+            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
+            
+            # Build judge prompt
+            judge_prompt = f"""GOAL COMPLETION JUDGE
+
+Original goal: {command}
+
+Current robot state:
+- Joint positions: {json.dumps(current_positions, indent=2)}
+- Current square: {current_square if current_square else "unknown"}
+
+Analyze the image and determine if the goal has been achieved.
+
+Output JSON:
 {{
-  "action": {{
-    "shoulder_pan.pos": <float>,
-    "shoulder_lift.pos": <float>,
-    "elbow_flex.pos": <float>,
-    "wrist_flex.pos": <float>,
-    "gripper.pos": <float>
-  }},
-  "explanation": "<brief explanation of the action>"
+  "goal_reached": <true if goal is achieved, false if not>,
+  "confidence": <0.0 to 1.0, how confident you are>,
+  "feedback": "<brief explanation of current state relative to goal>",
+  "whats_missing": "<if not reached, what still needs to be done>"
 }}
 
-Important:
-- Only include motors that need to change
-- Keep changes small and safe (max 10-20 degrees per step)
-- Ensure gripper values are between 0-100
-- Ensure joint angles are within safe ranges
+Examples:
+- Goal: "find a1" → reached if gripper is over a1 square
+- Goal: "touch a1" → reached if gripper is touching a1
+- Goal: "pick up piece" → reached if piece is in gripper
+"""
+            
+            user_content = [{"type": "text", "text": judge_prompt}]
+            
+            if isinstance(image_data, list):
+                for img in image_data:
+                    if img:
+                        user_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "high"}
+                        })
+            else:
+                if image_data:
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}", "detail": "high"}
+                    })
+            
+            messages = [
+                {"role": "system", "content": "You are a goal completion judge. Analyze if the robot has achieved its goal. Output only valid JSON."},
+                {"role": "user", "content": user_content}
+            ]
+            
+            is_reasoning_model = selected_model.startswith("o1") or selected_model.startswith("o3") or selected_model.startswith("o4")
+            
+            api_params = {
+                "model": selected_model,
+                "messages": messages
+            }
+            
+            if not is_reasoning_model:
+                api_params["response_format"] = {"type": "json_object"}
+                if not selected_model.startswith("gpt-5"):
+                    api_params["temperature"] = 0.2  # Lower temp for more consistent judging
+            else:
+                api_params["reasoning_effort"] = "low"  # Faster for judging
+            
+            response = self.llm_client.chat.completions.create(**api_params)
+            result = json.loads(response.choices[0].message.content)
+            
+            goal_reached = result.get("goal_reached", False)
+            feedback = result.get("feedback", "No feedback")
+            whats_missing = result.get("whats_missing", "")
+            
+            full_feedback = feedback
+            if whats_missing and not goal_reached:
+                full_feedback += f" Missing: {whats_missing}"
+            
+            return goal_reached, full_feedback
+            
+        except Exception as e:
+            print(f"⚠️ LLM goal judge failed: {e}")
+            return False, f"Judge error: {e}"
+    
+    def _rule_based_goal_judge(self, command: str, current_positions: Dict[str, float],
+                               current_square: Optional[str]) -> Tuple[bool, str]:
+        """Rule-based goal completion judge (fallback when no vision)."""
+        command_lower = command.lower()
+        
+        # Check for square-based goals
+        if "a1" in command_lower or "square a1" in command_lower:
+            if current_square == "a1":
+                return True, "Gripper is over square a1"
+            else:
+                return False, f"Not at a1 (currently at {current_square if current_square else 'unknown square'})"
+        
+        # Default: be conservative without vision
+        return False, "Goal status unknown without vision; continue iterations."
+    
+    def _build_llm_prompt(self, command: str, current_positions: Dict[str, float]) -> str:
+        """Build prompt for LLM with robot context and position model."""
+        # Update position model before building prompt
+        self.update_position_model()
+        
+        # Get current end-effector position
+        ee_pos = self.position_model.get("end_effector", (0, 0, 0))
+        ee_x, ee_y, ee_z = ee_pos
+        
+        # Get current square if calibration available
+        current_square = None
+        if "shoulder_pan" in current_positions and "shoulder_lift" in current_positions:
+            current_square = self.calculate_robot_square(
+                current_positions["shoulder_pan"],
+                current_positions["shoulder_lift"]
+            )
+        
+        # Get chess board calibration info
+        board_info = self.get_chess_board_info()
+        board_context = ""
+        if board_info:
+            board_context = f"""
+Chess Board Calibration:
+- Board is calibrated and ready for square-based movements
+- Reference square: {board_info.get('reference_square', 'unknown')}
+- Degrees per file (a->h): {board_info.get('degrees_per_file', 0):.2f}°
+- Degrees per rank (1->8): {board_info.get('degrees_per_rank', 0):.2f}°
+- Current square: {current_square if current_square else "unknown"}
+- To move to a square (e.g., "a1", "e4"), calculate:
+  * shoulder_pan = reference_pan + (file_index * degrees_per_file)
+  * shoulder_lift = reference_lift + (rank_index * degrees_per_rank)
+  * file_index: a=0, b=1, c=2, d=3, e=4, f=5, g=6, h=7
+  * rank_index: 1=0, 2=1, 3=2, 4=3, 5=4, 6=5, 7=6, 8=7
+"""
+        
+        prompt = f"""You control a 5-DOF robot arm for chess piece manipulation.
+
+⚠️ CRITICAL: THE CAMERA IS MOUNTED ON THE GRIPPER
+- The camera sees what the gripper sees
+- To "zoom out" and see the full board: RAISE the arm (lift shoulder, extend elbow)
+- To "zoom in" on a square: LOWER the arm toward the board
+- When close to board, camera sees only a small area around gripper
+
+MOTOR REFERENCE (what each motor does):
+- shoulder_pan: Rotates arm LEFT/RIGHT (negative=left, positive=right)
+- shoulder_lift: Tilts arm UP/DOWN (negative=down toward board, positive=up away)
+- elbow_flex: Extends/retracts forearm (negative=retracted/close, positive=extended/far)
+- wrist_flex: Angles gripper UP/DOWN (negative=gripper points down, positive=gripper points up)
+- gripper: Opens/closes jaws (0=fully open, 100=fully closed)
+
+KEY POSITIONS (approximate joint angles):
+┌─────────────────────────────────────────────────────────────────────┐
+│ REST/HOME POSITION (arm folded, safe):                              │
+│   shoulder_pan: 0°, shoulder_lift: 10°, elbow_flex: 20°,           │
+│   wrist_flex: 0°, gripper: 0                                        │
+├─────────────────────────────────────────────────────────────────────┤
+│ OVERVIEW POSITION (zoomed out, sees full board):                    │
+│   shoulder_pan: 0°, shoulder_lift: 30° to 50°, elbow_flex: 40°,    │
+│   wrist_flex: -30° (gripper points down at board)                   │
+├─────────────────────────────────────────────────────────────────────┤
+│ CHESS WORKING HEIGHT (above board, ready to move):                  │
+│   shoulder_lift: -30° to -50°, elbow_flex: -30° to -50°,           │
+│   wrist_flex: 0° to 10° (gripper nearly vertical)                   │
+├─────────────────────────────────────────────────────────────────────┤
+│ TOUCHING BOARD (gripper at board surface):                          │
+│   shoulder_lift: -60° to -80°, elbow_flex: -50° to -70°,           │
+│   wrist_flex: -5° to 5° (gripper vertical)                          │
+└─────────────────────────────────────────────────────────────────────┘
+
+CURRENT ROBOT STATE:
+- Joint positions: {json.dumps(current_positions, indent=2)}
+- End-effector position: x={ee_x:.1f}mm, y={ee_y:.1f}mm, z={ee_z:.1f}mm
+- Gripper state: {self.position_model.get('gripper', 0):.1f}%
+{board_context}
+USER COMMAND: {command}
+
+CAPABILITIES:
+1. GRIPPER-MOUNTED CAMERA VISION:
+   - Camera moves WITH the gripper
+   - To see full board: GO TO OVERVIEW POSITION FIRST (shoulder_lift ~40°, elbow_flex ~40°)
+   - Then analyze what you see before moving closer
+   - To see a specific square up close: lower arm toward that square
+
+2. SEQUENCE PLANNING (REQUIRED for find/locate tasks):
+   - Step 1: ALWAYS start by moving to OVERVIEW position to see the full board
+   - Step 2: From overview, identify target location visually
+   - Step 3: Move arm toward target incrementally (pan + lift)
+   - Step 4: Lower arm to get closer to target
+   - Step 5: Fine-tune position and touch if needed
+
+3. CHESS BOARD NAVIGATION:
+   - shoulder_pan controls which FILE (a-h, left-right)
+   - shoulder_lift + elbow_flex control which RANK (1-8, near-far) and HEIGHT
+   - a1 is typically at negative pan angles (left side)
+   - h8 is typically at positive pan angles (right side)
+
+OUTPUT FORMAT:
+For sequences (REQUIRED for "find X" or "go to X" tasks):
+{{
+  "sequence": [
+    {{
+      "step": 1,
+      "action": {{"shoulder_pan.pos": 0.0, "shoulder_lift.pos": 40.0, "elbow_flex.pos": 40.0, "wrist_flex.pos": -30.0}},
+      "description": "Move to OVERVIEW position - raise arm to see full board",
+      "wait_after": 1.5
+    }},
+    {{
+      "step": 2,
+      "action": {{"shoulder_pan.pos": -20.0, "shoulder_lift.pos": 20.0}},
+      "description": "Pan toward left side of board where a-file is located",
+      "wait_after": 1.0
+    }},
+    {{
+      "step": 3,
+      "action": {{"shoulder_lift.pos": -20.0, "elbow_flex.pos": -20.0}},
+      "description": "Lower arm toward board to get closer to target",
+      "wait_after": 1.0
+    }},
+    {{
+      "step": 4,
+      "action": {{"shoulder_lift.pos": -50.0, "elbow_flex.pos": -50.0, "wrist_flex.pos": 0.0}},
+      "description": "Final approach - lower gripper to touch target square",
+      "wait_after": 1.0
+    }}
+  ],
+  "explanation": "Plan: 1) Raise to overview to see board, 2) Pan toward a-file, 3) Lower incrementally, 4) Touch target"
+}}
+
+For single actions (simple movements only):
+{{
+  "action": {{"shoulder_pan.pos": <float>, ...}},
+  "explanation": "<brief explanation>"
+}}
+
+CRITICAL RULES:
+1. For ANY "find", "locate", "go to" task: ALWAYS start with OVERVIEW position
+2. Camera is on gripper - you can't see the board when arm is folded at rest
+3. Move to overview FIRST (shoulder_lift ~40°, elbow_flex ~40°, wrist_flex ~-30°)
+4. Then pan/tilt to find target visually
+5. Then lower incrementally to approach
+6. Keep step changes reasonable (15-30° per motor per step is OK for planned sequences)
+7. Use wait_after 1.0-1.5s for large movements, 0.5-1.0s for small adjustments
 """
         return prompt
     
-    def _validate_llm_action(self, action: Dict[str, Any], current_positions: Dict[str, float]) -> Optional[Dict[str, float]]:
-        """Validate and clamp LLM-generated action to safe values."""
+    def _validate_llm_action(self, action: Dict[str, Any], current_positions: Dict[str, float], 
+                              max_change: float = 15.0, is_sequence_step: bool = False) -> Optional[Dict[str, float]]:
+        """Validate and clamp LLM-generated action to safe values.
+        
+        Args:
+            action: Dict of motor positions
+            current_positions: Current/expected positions to validate against
+            max_change: Maximum degrees change per motor (default 15°, reduced for motor safety)
+            is_sequence_step: If True, allow slightly larger changes since sequence is pre-planned
+        """
         if not isinstance(action, dict):
+            print("⚠️ Validation failed: action is not a dict")
             return None
         
         safe_action = {}
-        max_change = 20.0  # Maximum degrees change per step
+        
+        # Reduced max change to prevent motor overheating
+        # Allow slightly larger changes in sequences, but still conservative
+        if is_sequence_step:
+            max_change = 20.0  # Reduced from 35° to prevent overheating
+        else:
+            max_change = 15.0  # Reduced from 25° for single actions
         
         for motor_name, value in action.items():
             # Remove .pos suffix if present
             motor_key = motor_name.replace(".pos", "")
             
             if motor_key not in self.all_motors:
+                print(f"⚠️ Unknown motor: {motor_key}")
                 continue
             
             try:
@@ -1954,6 +3071,8 @@ Important:
                 # Check change magnitude
                 change = abs(target_value - current_value)
                 if change > max_change:
+                    # Log the clamping
+                    print(f"⚠️ Clamping {motor_key}: {current_value:.1f}° → {target_value:.1f}° (Δ{change:.1f}° > {max_change}°)")
                     # Clamp to max change
                     if target_value > current_value:
                         target_value = current_value + max_change
@@ -1969,24 +3088,335 @@ Important:
                 
                 safe_action[f"{motor_key}.pos"] = target_value
                 
-            except (ValueError, TypeError):
+            except (ValueError, TypeError) as e:
+                print(f"⚠️ Invalid value for {motor_key}: {value} ({e})")
                 continue
+        
+        if not safe_action:
+            print("⚠️ Validation failed: no valid motors in action")
         
         return safe_action if safe_action else None
     
     def _execute_llm_action(self, action: Dict[str, float]):
-        """Execute validated LLM action on robot."""
+        """Execute validated LLM action on robot with overload/port error detection."""
         try:
+            overload_detected = False
+            port_conflict = False
+            
             for motor_key, value in action.items():
                 motor_name = motor_key.replace(".pos", "")
                 if motor_name in self.all_motors:
-                    self.bus.write("Goal_Position", motor_name, value, normalize=True)
-                    time.sleep(0.1)  # Small delay between commands
+                    try:
+                        self.bus.write("Goal_Position", motor_name, value, normalize=True)
+                        time.sleep(0.15)  # Increased delay for motor safety
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        print(f"   ⚠️ Motor {motor_name} write error: {e}")
+                        
+                        if "overload" in error_msg:
+                            overload_detected = True
+                            print(f"   🔥 OVERLOAD detected on {motor_name}")
+                        if "port is in use" in error_msg or ("port" in error_msg and "use" in error_msg):
+                            port_conflict = True
+                            print(f"   🔌 PORT CONFLICT detected")
+            
+            # Handle errors
+            if overload_detected:
+                print("   ⏸️ Pausing 3 seconds due to overload...")
+                time.sleep(3.0)  # Cool-down pause
+                raise RuntimeError("Motor overload detected - action stopped for safety")
+            
+            if port_conflict:
+                print("   ⏸️ Pausing 1 second due to port conflict...")
+                time.sleep(1.0)
+            
+            # Update position model after execution
+            time.sleep(0.5)  # Increased wait for motors to settle
+            self.update_position_model()
             
             self.status_bar.setText("✅ LLM action executed")
+        except RuntimeError:
+            raise  # Re-raise overload errors
         except Exception as e:
             self.status_bar.setText(f"❌ Execution error: {str(e)[:50]}...")
             raise
+    
+    def _execute_llm_sequence(self, sequence: List[Dict], initial_positions: Dict[str, float], original_command: str = "") -> bool:
+        """Execute a sequence of LLM actions with ADAPTIVE vision feedback loop.
+        
+        The feedback loop actually adjusts subsequent steps based on what the LLM sees:
+        1. Execute step
+        2. Capture image and analyze with LLM
+        3. LLM decides if adjustment needed
+        4. If yes, LLM generates corrective action that replaces/modifies next steps
+        """
+        try:
+            # Track both actual positions (from robot) and expected positions (from plan)
+            actual_positions = initial_positions.copy()
+            expected_positions = initial_positions.copy()  # Track what we EXPECT after each step
+            executed_steps = 0
+            remaining_sequence = list(sequence)  # Mutable copy we can modify
+            
+            print(f"🚀 Starting sequence with {len(sequence)} steps")
+            print(f"   Initial positions: {json.dumps({k: f'{v:.1f}°' for k, v in initial_positions.items()})}")
+            
+            while remaining_sequence:
+                step_data = remaining_sequence.pop(0)
+                step_num = step_data.get("step", executed_steps + 1)
+                step_action = step_data.get("action", {})
+                step_desc = step_data.get("description", f"Step {step_num}")
+                wait_after = step_data.get("wait_after", 0.5)
+                
+                print(f"\n📍 Step {step_num}: {step_desc}")
+                
+                # Try to update actual positions from robot, but don't fail if it errors
+                try:
+                    self.update_position_model()
+                    for motor_name in self.all_motors.keys():
+                        if motor_name in self.position_model["joints"]:
+                            actual_positions[motor_name] = self.position_model["joints"][motor_name]
+                except Exception as e:
+                    print(f"   ⚠️ Position read error: {e}, using expected positions")
+                
+                # Use EXPECTED positions for validation (what we planned to reach)
+                # This is more reliable than actual positions which may lag or have read errors
+                validation_positions = expected_positions.copy()
+                
+                # Validate this step with sequence-aware settings (more permissive)
+                safe_action = self._validate_llm_action(step_action, validation_positions, is_sequence_step=True)
+                
+                if not safe_action:
+                    self.status_bar.setText(f"⚠️ Step {step_num} failed validation: {step_desc}")
+                    print(f"⚠️ Skipping step {step_num}: validation failed")
+                    continue
+                
+                # Execute the step
+                try:
+                    self.status_bar.setText(f"🔄 Executing step {step_num}/{len(sequence)}: {step_desc}")
+                    print(f"   Sending commands: {json.dumps({k: f'{v:.1f}°' for k, v in safe_action.items()})}")
+                    
+                    # Track errors for overload/port conflict detection
+                    write_errors = []
+                    overload_detected = False
+                    port_conflict = False
+                    
+                    for motor_key, value in safe_action.items():
+                        motor_name = motor_key.replace(".pos", "")
+                        if motor_name in self.all_motors:
+                            try:
+                                self.bus.write("Goal_Position", motor_name, value, normalize=True)
+                                time.sleep(0.1)  # Increased delay between motor commands for safety
+                            except Exception as e:
+                                error_msg = str(e).lower()
+                                print(f"   ⚠️ Motor {motor_name} write error: {e}")
+                                write_errors.append((motor_name, error_msg))
+                                
+                                # Detect overload
+                                if "overload" in error_msg:
+                                    overload_detected = True
+                                    print(f"   🔥 OVERLOAD detected on {motor_name} - stopping sequence")
+                                
+                                # Detect port conflict
+                                if "port is in use" in error_msg or "port" in error_msg and "use" in error_msg:
+                                    port_conflict = True
+                                    print(f"   🔌 PORT CONFLICT detected - pausing")
+                    
+                    # If overload or port conflict, stop sequence and wait
+                    if overload_detected:
+                        self.status_bar.setText(f"⚠️ Motor overload detected - stopping sequence for safety")
+                        print("   🔥 OVERLOAD detected - stopping sequence and pausing 3 seconds...")
+                        time.sleep(3.0)  # Cool-down pause
+                        # Don't continue sequence - return False to stop
+                        return False
+                    
+                    if port_conflict:
+                        self.status_bar.setText(f"⚠️ Port conflict - pausing 1 second...")
+                        print("   ⏸️ Pausing 1 second due to port conflict...")
+                        time.sleep(1.0)  # Brief pause for port to free up
+                        # Continue but with longer wait
+                        wait_after = max(wait_after, 1.5)
+                    
+                    # Wait for motors to reach position
+                    time.sleep(wait_after)
+                    
+                    # Update EXPECTED positions with what we commanded (for next step validation)
+                    for motor_key, value in safe_action.items():
+                        motor_name = motor_key.replace(".pos", "")
+                        expected_positions[motor_name] = value
+                    
+                    # Also try to update actual positions from robot
+                    try:
+                        self.update_position_model()
+                        for motor_name in self.all_motors.keys():
+                            if motor_name in self.position_model["joints"]:
+                                actual_positions[motor_name] = self.position_model["joints"][motor_name]
+                    except Exception as e:
+                        print(f"   ⚠️ Position read error: {e}")
+                    
+                    executed_steps += 1
+                    print(f"✅ Step {step_num} completed: {step_desc}")
+                    
+                    # ADAPTIVE VISION FEEDBACK LOOP
+                    # This actually adjusts subsequent steps based on what the LLM sees
+                    if self.vision_enabled_checkbox.isChecked() and self.llm_enabled and remaining_sequence:
+                        try:
+                            camera_source = self.vision_camera_combo.currentText().split()[0].lower()
+                            image_data = self.capture_camera_image(camera_source)
+                            
+                            if image_data:
+                                self.status_bar.setText(f"👁️ Analyzing scene after step {step_num}...")
+                                
+                                # Get adaptive feedback - LLM can suggest adjustments
+                                adjustment = self._get_adaptive_feedback(
+                                    original_command=original_command,
+                                    completed_step=step_desc,
+                                    remaining_steps=[s.get("description", "") for s in remaining_sequence],
+                                    current_positions=expected_positions,  # Use expected positions for context
+                                    image_data=image_data
+                                )
+                                
+                                if adjustment:
+                                    if adjustment.get("needs_adjustment", False):
+                                        # LLM wants to modify the plan
+                                        new_steps = adjustment.get("corrective_steps", [])
+                                        feedback_text = adjustment.get("feedback", "Adjusting plan...")
+                                        
+                                        print(f"🔄 Vision feedback: {feedback_text}")
+                                        print(f"   Inserting {len(new_steps)} corrective steps")
+                                        
+                                        # Display feedback
+                                        current_reasoning = self.llm_reasoning_display.toPlainText()
+                                        self.llm_reasoning_display.setText(
+                                            current_reasoning + f"\n\n👁️ ADAPTIVE ADJUSTMENT after step {step_num}:\n{feedback_text}\n→ Adding {len(new_steps)} corrective steps"
+                                        )
+                                        
+                                        # INSERT corrective steps at the front of remaining sequence
+                                        for i, new_step in enumerate(reversed(new_steps)):
+                                            new_step["step"] = f"{step_num}.{len(new_steps)-i}"  # e.g., "3.1", "3.2"
+                                            remaining_sequence.insert(0, new_step)
+                                    else:
+                                        # LLM says we're on track
+                                        feedback_text = adjustment.get("feedback", "On track")
+                                        print(f"👁️ Vision feedback: {feedback_text}")
+                                        current_reasoning = self.llm_reasoning_display.toPlainText()
+                                        self.llm_reasoning_display.setText(
+                                            current_reasoning + f"\n\n👁️ After step {step_num}: {feedback_text}"
+                                        )
+                        except Exception as e:
+                            print(f"⚠️ Adaptive feedback error: {e}")
+                    
+                except Exception as e:
+                    self.status_bar.setText(f"❌ Step {step_num} execution error: {str(e)[:50]}...")
+                    print(f"❌ Step {step_num} failed: {e}")
+                    continue
+            
+            return executed_steps > 0
+            
+        except Exception as e:
+            self.status_bar.setText(f"❌ Sequence execution error: {str(e)[:50]}...")
+            print(f"❌ Sequence execution failed: {e}")
+            return False
+    
+    def _get_adaptive_feedback(self, original_command: str, completed_step: str, 
+                                remaining_steps: List[str], current_positions: Dict[str, float],
+                                image_data) -> Optional[Dict]:
+        """Get adaptive feedback from LLM - can suggest corrective steps.
+        
+        Returns:
+            {
+                "needs_adjustment": bool,
+                "feedback": str,
+                "corrective_steps": [{"action": {...}, "description": "...", "wait_after": 0.5}, ...]
+            }
+        """
+        try:
+            if not self.llm_enabled or not self.llm_client:
+                return None
+            
+            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
+            
+            # Get current square if available
+            current_square = None
+            if "shoulder_pan" in current_positions and "shoulder_lift" in current_positions:
+                current_square = self.calculate_robot_square(
+                    current_positions["shoulder_pan"],
+                    current_positions["shoulder_lift"]
+                )
+            
+            # Build adaptive feedback prompt
+            prompt = f"""ADAPTIVE FEEDBACK REQUEST
+
+Original task: {original_command}
+Just completed: {completed_step}
+Remaining planned steps: {remaining_steps if remaining_steps else "None"}
+
+Current robot state:
+- Joint positions: {json.dumps(current_positions, indent=2)}
+- Current square (if on board): {current_square if current_square else "unknown"}
+
+Analyze the image and decide if adjustment is needed.
+
+Output JSON:
+{{
+  "needs_adjustment": <true if plan needs correction, false if on track>,
+  "feedback": "<brief description of what you see and whether target is visible/reachable>",
+  "corrective_steps": [
+    // ONLY if needs_adjustment is true, provide 1-3 corrective steps:
+    {{
+      "action": {{"shoulder_pan.pos": <float>, "shoulder_lift.pos": <float>, ...}},
+      "description": "<what this corrective step does>",
+      "wait_after": 0.5
+    }}
+  ]
+}}
+
+Guidelines:
+- If target is visible and we're on track, set needs_adjustment: false
+- If target is not visible or we're off course, suggest corrective steps
+- Keep corrective steps small (max 10-15 degrees per motor)
+- Focus on getting the target in view or getting closer to it
+"""
+            
+            # Build vision message
+            user_content = [{"type": "text", "text": prompt}]
+            
+            if isinstance(image_data, list):
+                for img in image_data:
+                    if img:
+                        user_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "low"}
+                        })
+            else:
+                if image_data:
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}", "detail": "low"}
+                    })
+            
+            messages = [
+                {"role": "system", "content": "You are a robot control assistant with vision. Analyze scenes and suggest adjustments. Output only valid JSON."},
+                {"role": "user", "content": user_content}
+            ]
+            
+            # Get response - use model-appropriate parameters
+            api_params = {
+                "model": selected_model,
+                "messages": messages,
+            }
+            if not selected_model.startswith("o"):
+                api_params["max_tokens"] = 500
+                api_params["response_format"] = {"type": "json_object"}
+            else:
+                api_params["max_completion_tokens"] = 500
+            response = self.llm_client.chat.completions.create(**api_params)
+            
+            result = json.loads(response.choices[0].message.content)
+            return result
+            
+        except Exception as e:
+            print(f"⚠️ Adaptive feedback failed: {e}")
+            return None
     
     def move_gripper(self, dx_mm, dy_mm, dz_mm):
         """Move gripper by specified amounts in base coordinates."""
@@ -2080,6 +3510,31 @@ Important:
         self.workspace_side_canvas.set_robot_position(x_mm, y_mm, z_mm)
         self.workspace_top_canvas.set_robot_position(x_mm, y_mm, z_mm)
     
+    def update_position_model(self):
+        """Update internal position model with current robot state."""
+        try:
+            # Read current joint positions
+            for motor_name in self.all_motors.keys():
+                try:
+                    pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                    self.position_model["joints"][motor_name] = pos
+                except:
+                    pass
+            
+            # Calculate end-effector position
+            joint_positions = {k: v for k, v in self.position_model["joints"].items() if k != "gripper"}
+            x, y, z, method = self.calculate_base_coordinates(joint_positions)
+            self.position_model["end_effector"] = (x, y, z)
+            
+            # Get gripper state
+            self.position_model["gripper"] = self.position_model["joints"].get("gripper", 0.0)
+            
+            # Update timestamp
+            self.position_model["last_update"] = time.time()
+            
+        except Exception as e:
+            print(f"⚠️ Position model update error: {e}")
+    
     def calculate_base_coordinates(self, joint_positions):
         """Calculate end-effector position in robot base frame."""
         try:
@@ -2156,23 +3611,112 @@ Important:
         except:
             return None
     
-    def update_camera(self, pixmap):
-        """Update camera view from monitoring thread."""
-        self.camera_label.setPixmap(pixmap)
-        self.camera_status.setText("[LIVE]")
-        self.camera_status.setStyleSheet("color: #3fb950;")
+    def square_to_joint_positions(self, square: str) -> Optional[Dict[str, float]]:
+        """Convert chess square (e.g., 'a1') to approximate joint positions.
+        Returns dict with shoulder_pan and shoulder_lift, or None if calibration not available."""
+        try:
+            calib_dir = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower"
+            chess_calib_file = calib_dir / "chess_coordinate_system.json"
+            
+            if not chess_calib_file.exists():
+                return None
+            
+            with open(chess_calib_file) as f:
+                chess_system = json.load(f)
+            
+            if not chess_system.get("coordinate_system_calculated", False):
+                return None
+            
+            # Parse square (e.g., "a1" -> file=0, rank=0)
+            file_char = square[0].lower()
+            rank_char = square[1]
+            file_idx = ord(file_char) - ord('a')
+            rank_idx = int(rank_char) - 1
+            
+            if not (0 <= file_idx <= 7 and 0 <= rank_idx <= 7):
+                return None
+            
+            # Get calibration parameters
+            ref_pos = chess_system["reference_position"]
+            degrees_per_file = chess_system["degrees_per_file"]
+            degrees_per_rank = chess_system["degrees_per_rank"]
+            
+            # Calculate target joint positions
+            target_pan = ref_pos["shoulder_pan"] + (file_idx * degrees_per_file)
+            target_lift = ref_pos["shoulder_lift"] + (rank_idx * degrees_per_rank)
+            
+            return {
+                "shoulder_pan": target_pan,
+                "shoulder_lift": target_lift
+            }
+        except Exception as e:
+            print(f"⚠️ Square to position conversion error: {e}")
+            return None
+    
+    def get_chess_board_info(self) -> Optional[Dict]:
+        """Get chess board calibration information for LLM context."""
+        try:
+            calib_dir = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower"
+            chess_calib_file = calib_dir / "chess_coordinate_system.json"
+            
+            if not chess_calib_file.exists():
+                return None
+            
+            with open(chess_calib_file) as f:
+                chess_system = json.load(f)
+            
+            if not chess_system.get("coordinate_system_calculated", False):
+                return None
+            
+            return {
+                "calibrated": True,
+                "reference_square": chess_system.get("reference_square", "unknown"),
+                "degrees_per_file": chess_system.get("degrees_per_file", 0),
+                "degrees_per_rank": chess_system.get("degrees_per_rank", 0),
+                "reference_position": chess_system.get("reference_position", {})
+            }
+        except:
+            return None
+    
+    def update_main_camera(self, pixmap):
+        """Update main camera view from monitoring thread."""
+        self.main_camera_label.setPixmap(pixmap)
+        self.main_camera_status.setText("[LIVE]")
+        self.main_camera_status.setStyleSheet("color: #3fb950;")
         
-        # Update FPS (simple counter - could be improved)
-        if not hasattr(self, '_frame_count'):
-            self._frame_count = 0
-            self._last_fps_time = time.time()
-        self._frame_count += 1
+        # Update FPS for main camera
+        if not hasattr(self, '_main_frame_count'):
+            self._main_frame_count = 0
+            self._main_last_fps_time = time.time()
+        self._main_frame_count += 1
         current_time = time.time()
-        if current_time - self._last_fps_time >= 1.0:
-            fps = self._frame_count / (current_time - self._last_fps_time)
-            self.fps_label.setText(f"FPS: {fps:.1f}")
-            self._frame_count = 0
-            self._last_fps_time = current_time
+        if current_time - self._main_last_fps_time >= 1.0:
+            main_fps = self._main_frame_count / (current_time - self._main_last_fps_time)
+            self._main_fps = main_fps
+            gripper_fps = getattr(self, '_gripper_fps', 0)
+            self.fps_label.setText(f"FPS: Main: {main_fps:.1f} | Gripper: {gripper_fps:.1f}")
+            self._main_frame_count = 0
+            self._main_last_fps_time = current_time
+    
+    def update_gripper_camera(self, pixmap):
+        """Update gripper camera view from monitoring thread."""
+        self.gripper_camera_label.setPixmap(pixmap)
+        self.gripper_camera_status.setText("[LIVE]")
+        self.gripper_camera_status.setStyleSheet("color: #3fb950;")
+        
+        # Update FPS for gripper camera
+        if not hasattr(self, '_gripper_frame_count'):
+            self._gripper_frame_count = 0
+            self._gripper_last_fps_time = time.time()
+        self._gripper_frame_count += 1
+        current_time = time.time()
+        if current_time - self._gripper_last_fps_time >= 1.0:
+            gripper_fps = self._gripper_frame_count / (current_time - self._gripper_last_fps_time)
+            self._gripper_fps = gripper_fps
+            main_fps = getattr(self, '_main_fps', 0)
+            self.fps_label.setText(f"FPS: Main: {main_fps:.1f} | Gripper: {gripper_fps:.1f}")
+            self._gripper_frame_count = 0
+            self._gripper_last_fps_time = current_time
     
     def update_motors(self, motor_data):
         """Update motor positions and status from monitoring thread."""
@@ -2325,8 +3869,9 @@ Important:
     
     def start_monitoring(self):
         """Start monitoring threads."""
-        self.monitor_thread = MonitoringThread(self.bus, self.camera)
-        self.monitor_thread.camera_update.connect(self.update_camera)
+        self.monitor_thread = MonitoringThread(self.bus, self.cameras)
+        self.monitor_thread.main_camera_update.connect(self.update_main_camera)
+        self.monitor_thread.gripper_camera_update.connect(self.update_gripper_camera)
         self.monitor_thread.motor_update.connect(self.update_motors)
         self.monitor_thread.status_update.connect(self.status_bar.setText)
         self.monitor_thread.running = True
@@ -2370,6 +3915,266 @@ Important:
         # The monitoring thread will update automatically
         QTimer.singleShot(1000, lambda: self.status_bar.setText("✅ Refresh complete"))
     
+    def restart_app(self):
+        """Restart the application."""
+        import sys
+        import os
+        self.status_bar.setText("🔄 Restarting application...")
+        
+        # Stop monitoring thread
+        if hasattr(self, 'monitor_thread'):
+            self.monitor_thread.stop()
+            self.monitor_thread.wait()
+        
+        # Close the window
+        self.close()
+        
+        # Restart the application
+        python = sys.executable
+        os.execl(python, python, *sys.argv)
+    
+    def start_calibration(self):
+        """Start physical chess board calibration by moving gripper to corners."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
+        from PySide6.QtCore import QTimer
+        
+        class PhysicalCalibrationDialog(QDialog):
+            def __init__(self, parent):
+                super().__init__(parent)
+                self.setWindowTitle("Physical Chess Board Calibration")
+                self.setModal(True)
+                self.corners = []
+                self.corner_names = ["a1", "h1", "h8", "a8"]
+                self.current_corner_idx = 0
+                self.parent_ui = parent
+                
+                layout = QVBoxLayout(self)
+                layout.setSpacing(20)
+                layout.setContentsMargins(20, 20, 20, 20)
+                
+                # Instructions
+                self.instruction_label = QLabel(
+                    f"Step {self.current_corner_idx + 1}/4:\n\n"
+                    f"Manually move the gripper to corner: {self.corner_names[0]}\n"
+                    f"Then click RECORD POSITION"
+                )
+                self.instruction_label.setStyleSheet("""
+                    font-size: 14pt;
+                    font-weight: bold;
+                    color: #58a6ff;
+                    padding: 20px;
+                    background: #161b22;
+                    border: 1px solid #30363d;
+                    border-radius: 6px;
+                """)
+                self.instruction_label.setAlignment(Qt.AlignCenter)
+                self.instruction_label.setWordWrap(True)
+                layout.addWidget(self.instruction_label)
+                
+                # Current position display
+                self.position_label = QLabel("Current motor positions:\nWaiting...")
+                self.position_label.setStyleSheet("""
+                    font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+                    font-size: 11pt;
+                    color: #8b949e;
+                    padding: 15px;
+                    background: #0d1117;
+                    border: 1px solid #30363d;
+                    border-radius: 4px;
+                """)
+                layout.addWidget(self.position_label)
+                
+                # Update timer
+                self.timer = QTimer(self)
+                self.timer.timeout.connect(self.update_current_position)
+                self.timer.start(100)  # Update 10 times per second
+                
+                # Button row
+                button_row = QHBoxLayout()
+                
+                self.record_btn = QPushButton("RECORD POSITION")
+                self.record_btn.clicked.connect(self.record_corner)
+                self.record_btn.setStyleSheet("""
+                    QPushButton {
+                        background: #238636;
+                        color: white;
+                        font-weight: bold;
+                        font-size: 12pt;
+                        padding: 12px 24px;
+                        border-radius: 6px;
+                    }
+                    QPushButton:hover { background: #2ea043; }
+                """)
+                button_row.addWidget(self.record_btn)
+                
+                undo_btn = QPushButton("Undo Last")
+                undo_btn.clicked.connect(self.undo_last)
+                button_row.addWidget(undo_btn)
+                
+                cancel_btn = QPushButton("Cancel")
+                cancel_btn.clicked.connect(self.reject)
+                button_row.addWidget(cancel_btn)
+                
+                layout.addLayout(button_row)
+                
+                self.resize(600, 400)
+            
+            def update_current_position(self):
+                """Update display with current motor positions."""
+                try:
+                    positions = {}
+                    for motor_name in self.parent_ui.all_motors.keys():
+                        try:
+                            pos = self.parent_ui.bus.read("Present_Position", motor_name, normalize=True)
+                            positions[motor_name] = f"{pos:.1f}°"
+                        except:
+                            positions[motor_name] = "N/A"
+                    
+                    pos_text = "Current motor positions:\n" + "\n".join([f"{k}: {v}" for k, v in positions.items()])
+                    self.position_label.setText(pos_text)
+                except:
+                    pass
+            
+            def record_corner(self):
+                """Record current motor positions for this corner."""
+                try:
+                    # Read all motor positions
+                    positions = {}
+                    for motor_name in self.parent_ui.all_motors.keys():
+                        pos = self.parent_ui.bus.read("Present_Position", motor_name, normalize=True)
+                        positions[motor_name] = pos
+                    
+                    # Calculate XYZ using forward kinematics
+                    if self.parent_ui.kinematics:
+                        joint_angles = [positions[name] for name in self.parent_ui.all_motors.keys()]
+                        xyz = self.parent_ui.kinematics.forward(np.deg2rad(joint_angles))[:3]
+                    else:
+                        # Fallback: use simple approximation
+                        xyz = np.array([0.0, 0.0, 0.0])
+                    
+                    self.corners.append({
+                        'name': self.corner_names[self.current_corner_idx],
+                        'motors': positions,
+                        'xyz': xyz
+                    })
+                    
+                    self.current_corner_idx += 1
+                    
+                    if self.current_corner_idx < 4:
+                        self.instruction_label.setText(
+                            f"Step {self.current_corner_idx + 1}/4:\n\n"
+                            f"Manually move the gripper to corner: {self.corner_names[self.current_corner_idx]}\n"
+                            f"Then click RECORD POSITION"
+                        )
+                    else:
+                        self.timer.stop()
+                        self.instruction_label.setText(
+                            "✅ All 4 corners recorded!\n\n"
+                            "Click SAVE to complete calibration"
+                        )
+                        self.record_btn.setText("SAVE CALIBRATION")
+                        self.record_btn.clicked.disconnect()
+                        self.record_btn.clicked.connect(self.accept)
+                except Exception as e:
+                    self.instruction_label.setText(f"❌ Error recording position: {e}")
+            
+            def undo_last(self):
+                """Undo the last recorded corner."""
+                if self.corners:
+                    self.corners.pop()
+                    self.current_corner_idx -= 1
+                    self.instruction_label.setText(
+                        f"Step {self.current_corner_idx + 1}/4:\n\n"
+                        f"Manually move the gripper to corner: {self.corner_names[self.current_corner_idx]}\n"
+                        f"Then click RECORD POSITION"
+                    )
+                    if self.record_btn.text() == "SAVE CALIBRATION":
+                        self.record_btn.setText("RECORD POSITION")
+                        self.record_btn.clicked.disconnect()
+                        self.record_btn.clicked.connect(self.record_corner)
+                        self.timer.start(100)
+        
+        # Get current state
+        if not hasattr(self, 'bus') or not self.bus:
+            self.status_bar.setText("❌ Robot not connected")
+            return
+        
+        dialog = PhysicalCalibrationDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            # Save calibration
+            self.save_board_calibration_physical(dialog.corners)
+    
+    def save_board_calibration_physical(self, corners_data):
+        """Save chess board calibration from physical corner measurements."""
+        try:
+            from lerobot.perception.chess.board_model import BoardModel
+            from lerobot.configs.chessboard import ChessBoardParams
+            from lerobot.utils.geometry import SE3
+            
+            # Extract XYZ coordinates from corners
+            corners_xyz = np.array([c['xyz'] for c in corners_data])
+            
+            # Define board frame: a1 at origin, h1 along +X, a8 along +Y
+            # 8 squares × 50mm = 400mm = 0.4m
+            board_corners_ideal = np.array([
+                [0.0, 0.0, 0.0],      # a1
+                [0.4, 0.0, 0.0],      # h1
+                [0.4, 0.4, 0.0],      # h8
+                [0.0, 0.4, 0.0],      # a8
+            ])
+            
+            # Calculate rigid transform from board frame to robot base frame
+            # Using Procrustes / least-squares rigid alignment
+            centroid_board = board_corners_ideal.mean(axis=0)
+            centroid_robot = corners_xyz.mean(axis=0)
+            
+            # Center the points
+            board_centered = board_corners_ideal - centroid_board
+            robot_centered = corners_xyz - centroid_robot
+            
+            # Compute rotation using SVD
+            H = board_centered.T @ robot_centered
+            U, _, Vt = np.linalg.svd(H)
+            R = Vt.T @ U.T
+            
+            # Ensure proper rotation (det = 1)
+            if np.linalg.det(R) < 0:
+                Vt[-1, :] *= -1
+                R = Vt.T @ U.T
+            
+            # Compute translation
+            t = centroid_robot - R @ centroid_board
+            
+            # Create SE3 transform
+            T_base_board = SE3.from_rt(R, t)
+            
+            # Create board model
+            board_model = BoardModel(
+                params=ChessBoardParams(square_size_mm=50.0),
+                T_base_board=T_base_board
+            )
+            
+            # Save to calibration directory
+            calib_dir = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower"
+            calib_dir.mkdir(parents=True, exist_ok=True)
+            out_path = calib_dir / "chess_board_model.json"
+            board_model.save(out_path)
+            
+            # Also save motor positions for reference
+            motor_calib_path = calib_dir / "chess_corner_motors.json"
+            with open(motor_calib_path, 'w') as f:
+                json.dump(corners_data, f, indent=2, default=lambda x: x.tolist() if isinstance(x, np.ndarray) else x)
+            
+            self.status_bar.setText(f"✅ Physical calibration saved! LLM can now control chess positions.")
+            print(f"✅ Chess board physical calibration completed")
+            print(f"   Board model: {out_path}")
+            print(f"   Motor positions: {motor_calib_path}")
+        except Exception as e:
+            self.status_bar.setText(f"❌ Calibration save failed: {e}")
+            print(f"❌ Calibration error: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def setup_file_watcher(self):
         """Setup file watcher for hot reload in development mode."""
         try:
@@ -2398,22 +4203,26 @@ Important:
 
 def main():
     import argparse
-    p = argparse.ArgumentParser(description="Chess Robot Monitoring UI with LLM Control")
+    p = argparse.ArgumentParser(description="Chess Robot Monitoring UI with ChatKit LLM Control")
     p.add_argument("--port", required=True, help="Robot serial port")
     p.add_argument("--dev", action="store_true", help="Enable development mode with file watching")
     p.add_argument("--api-key", type=str, help="OpenAI API key (or set OPENAI_API_KEY env var)")
+    p.add_argument("--workflow-id", type=str, help="ChatKit workflow ID from Agent Builder (or set OPENAI_CHATKIT_WORKFLOW_ID env var)")
     args = p.parse_args()
     
     app = QApplication([])
     
     try:
-        ui = ChessRobotUILLM(args.port, dev_mode=args.dev, api_key=args.api_key)
+        ui = ChessRobotUILLM(args.port, dev_mode=args.dev, api_key=args.api_key, workflow_id=args.workflow_id)
         ui.show()
-        print("🚀 Starting Chess Robot UI with LLM Control...")
+        print("🚀 Starting Chess Robot UI with ChatKit LLM Control...")
         if args.dev:
             print("🔧 Development mode: File watching enabled")
         if ui.llm_enabled:
-            print("✅ LLM control enabled")
+            if ui.chatkit_session:
+                print(f"✅ ChatKit enabled with workflow: {ui.workflow_id}")
+            else:
+                print("✅ LLM control enabled (using direct chat.completions)")
         else:
             print("⚠️ LLM control disabled - set OPENAI_API_KEY or use --api-key")
         print("Close the window or click 'Stop' to exit")
