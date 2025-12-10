@@ -8,7 +8,8 @@ Shows live camera feed, motor status, chess board diagram, and LLM-based natural
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QGroupBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox, QFrame, QToolTip, QScrollArea,
-    QTextEdit, QLineEdit, QPlainTextEdit, QSizePolicy, QCheckBox, QSpinBox
+    QTextEdit, QLineEdit, QPlainTextEdit, QSizePolicy, QCheckBox, QSpinBox,
+    QDialog, QSlider, QDoubleSpinBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QFileSystemWatcher
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush, QFont, QKeySequence, QShortcut
@@ -64,7 +65,7 @@ except ImportError:
     # Note: ChatKit Python SDK is optional - install with: pip install openai-chatkit
 
 # Robot imports
-from lerobot.motors.feetech.feetech import FeetechMotorsBus
+from lerobot.motors.feetech.feetech import FeetechMotorsBus, OperatingMode
 from lerobot.motors.motors_bus import Motor, MotorNormMode, MotorCalibration
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
@@ -608,6 +609,79 @@ class MonitoringThread(QThread):
             # Connect systems
             self.bus._connect(handshake=False)
             
+            # Configure motors 3, 4, and 6 with gentler settings to reduce stiffness
+            print("🔧 Configuring motors 3, 4, and 6 with gentler settings...")
+            with self.bus.torque_disabled():
+                # Configure motor 3 (elbow_flex) - reduce stiffness
+                # First verify motor 3 exists and can be read before configuring
+                if "elbow_flex" in self.bus.motors:
+                    try:
+                        # Verify motor exists by trying to read its position
+                        test_read = self.bus.read("Present_Position", "elbow_flex", normalize=False)
+                        print(f"  📝 Configuring elbow_flex (motor 3) - current position: {test_read}")
+                        
+                        self.bus.write("Operating_Mode", "elbow_flex", OperatingMode.POSITION.value)
+                        # Reduce P coefficient for less stiffness (default is 32, we use 12)
+                        self.bus.write("P_Coefficient", "elbow_flex", 12)
+                        # Reduce D coefficient (default is 32, we use 18)
+                        self.bus.write("D_Coefficient", "elbow_flex", 18)
+                        # Keep I coefficient at 0
+                        self.bus.write("I_Coefficient", "elbow_flex", 0)
+                        # Add torque limits to prevent overload
+                        self.bus.write("Max_Torque_Limit", "elbow_flex", 650)  # 65% of max (slightly higher than wrist)
+                        self.bus.write("Protection_Current", "elbow_flex", 325)  # 65% of max current
+                        self.bus.write("Overload_Torque", "elbow_flex", 32)  # 32% torque when overloaded
+                        print("    ✅ elbow_flex configured with reduced stiffness")
+                    except Exception as e:
+                        print(f"    ⚠️ Could not configure elbow_flex (motor 3): {e}")
+                        print(f"    ⏭️ Skipping motor 3 configuration - motor may not be connected or detected")
+                
+                # Configure motor 4 (wrist_flex) - reduce stiffness
+                if "wrist_flex" in self.bus.motors:
+                    try:
+                        # Verify motor exists
+                        test_read = self.bus.read("Present_Position", "wrist_flex", normalize=False)
+                        print(f"  📝 Configuring wrist_flex (motor 4) - current position: {test_read}")
+                        
+                        self.bus.write("Operating_Mode", "wrist_flex", OperatingMode.POSITION.value)
+                        # Reduce P coefficient for less stiffness (default is 32, we use 10)
+                        self.bus.write("P_Coefficient", "wrist_flex", 10)
+                        # Reduce D coefficient (default is 32, we use 16)
+                        self.bus.write("D_Coefficient", "wrist_flex", 16)
+                        # Keep I coefficient at 0
+                        self.bus.write("I_Coefficient", "wrist_flex", 0)
+                        # Add torque limits similar to gripper to prevent overload
+                        self.bus.write("Max_Torque_Limit", "wrist_flex", 600)  # 60% of max
+                        self.bus.write("Protection_Current", "wrist_flex", 300)  # 60% of max current
+                        self.bus.write("Overload_Torque", "wrist_flex", 30)  # 30% torque when overloaded
+                        print("    ✅ wrist_flex configured with reduced stiffness")
+                    except Exception as e:
+                        print(f"    ⚠️ Could not configure wrist_flex (motor 4): {e}")
+                
+                # Configure motor 6 (gripper) - further reduce stiffness
+                if "gripper" in self.bus.motors:
+                    try:
+                        # Verify motor exists
+                        test_read = self.bus.read("Present_Position", "gripper", normalize=False)
+                        print(f"  📝 Configuring gripper (motor 6) - current position: {test_read}")
+                        
+                        self.bus.write("Operating_Mode", "gripper", OperatingMode.POSITION.value)
+                        # Reduce P coefficient further (default is 32, we use 8)
+                        self.bus.write("P_Coefficient", "gripper", 8)
+                        # Reduce D coefficient (default is 32, we use 12)
+                        self.bus.write("D_Coefficient", "gripper", 12)
+                        # Keep I coefficient at 0
+                        self.bus.write("I_Coefficient", "gripper", 0)
+                        # Reduce torque limits further to prevent overload
+                        self.bus.write("Max_Torque_Limit", "gripper", 400)  # 40% of max (reduced from 500)
+                        self.bus.write("Protection_Current", "gripper", 200)  # 40% of max current (reduced from 250)
+                        self.bus.write("Overload_Torque", "gripper", 20)  # 20% torque when overloaded (reduced from 25)
+                        print("    ✅ gripper configured with reduced stiffness")
+                    except Exception as e:
+                        print(f"    ⚠️ Could not configure gripper (motor 6): {e}")
+            
+            print("✅ Motor configuration complete")
+            
             # Connect all cameras
             for cam_name, camera in self.cameras.items():
                 try:
@@ -971,6 +1045,88 @@ class ChessRobotUILLM(QMainWindow):
             )
         
         self.bus = FeetechMotorsBus(port=self.port, motors=self.all_motors, calibration=calibration)
+    
+    def configure_motors_gentle(self):
+        """Configure motors 3 (elbow_flex), 4 (wrist_flex), and 6 (gripper) with gentler settings to reduce stiffness.
+        
+        This reduces PID coefficients and adds torque limits to prevent overload and stiffness.
+        """
+        if not hasattr(self, 'bus') or not self.bus.is_connected:
+            print("⚠️ Cannot configure motors - bus not connected")
+            return
+        
+        print("🔧 Configuring motors 3, 4, and 6 with gentler settings...")
+        
+        with self.bus.torque_disabled():
+            # Configure motor 3 (elbow_flex) - reduce stiffness
+            # First verify motor 3 exists and can be read before configuring
+            if "elbow_flex" in self.all_motors:
+                try:
+                    # Verify motor exists by trying to read its position
+                    test_read = self.bus.read("Present_Position", "elbow_flex", normalize=False)
+                    print(f"  📝 Configuring elbow_flex (motor 3) - current position: {test_read}")
+                    
+                    self.bus.write("Operating_Mode", "elbow_flex", OperatingMode.POSITION.value)
+                    # Reduce P coefficient for less stiffness (default is 32, we use 12)
+                    self.bus.write("P_Coefficient", "elbow_flex", 12)
+                    # Reduce D coefficient (default is 32, we use 18)
+                    self.bus.write("D_Coefficient", "elbow_flex", 18)
+                    # Keep I coefficient at 0
+                    self.bus.write("I_Coefficient", "elbow_flex", 0)
+                    # Add torque limits to prevent overload
+                    self.bus.write("Max_Torque_Limit", "elbow_flex", 650)  # 65% of max (slightly higher than wrist)
+                    self.bus.write("Protection_Current", "elbow_flex", 325)  # 65% of max current
+                    self.bus.write("Overload_Torque", "elbow_flex", 32)  # 32% torque when overloaded
+                    print("    ✅ elbow_flex configured with reduced stiffness")
+                except Exception as e:
+                    print(f"    ⚠️ Could not configure elbow_flex (motor 3): {e}")
+                    print(f"    ⏭️ Skipping motor 3 configuration - motor may not be connected or detected")
+            
+            # Configure motor 4 (wrist_flex) - reduce stiffness
+            if "wrist_flex" in self.all_motors:
+                try:
+                    # Verify motor exists
+                    test_read = self.bus.read("Present_Position", "wrist_flex", normalize=False)
+                    print(f"  📝 Configuring wrist_flex (motor 4) - current position: {test_read}")
+                    
+                    self.bus.write("Operating_Mode", "wrist_flex", OperatingMode.POSITION.value)
+                    # Reduce P coefficient for less stiffness (default is 32, we use 10)
+                    self.bus.write("P_Coefficient", "wrist_flex", 10)
+                    # Reduce D coefficient (default is 32, we use 16)
+                    self.bus.write("D_Coefficient", "wrist_flex", 16)
+                    # Keep I coefficient at 0
+                    self.bus.write("I_Coefficient", "wrist_flex", 0)
+                    # Add torque limits similar to gripper to prevent overload
+                    self.bus.write("Max_Torque_Limit", "wrist_flex", 600)  # 60% of max (more than gripper but still limited)
+                    self.bus.write("Protection_Current", "wrist_flex", 300)  # 60% of max current
+                    self.bus.write("Overload_Torque", "wrist_flex", 30)  # 30% torque when overloaded
+                    print("    ✅ wrist_flex configured with reduced stiffness")
+                except Exception as e:
+                    print(f"    ⚠️ Could not configure wrist_flex (motor 4): {e}")
+            
+            # Configure motor 6 (gripper) - further reduce stiffness
+            if "gripper" in self.all_motors:
+                try:
+                    # Verify motor exists
+                    test_read = self.bus.read("Present_Position", "gripper", normalize=False)
+                    print(f"  📝 Configuring gripper (motor 6) - current position: {test_read}")
+                    
+                    self.bus.write("Operating_Mode", "gripper", OperatingMode.POSITION.value)
+                    # Reduce P coefficient further (default is 32, we use 8)
+                    self.bus.write("P_Coefficient", "gripper", 8)
+                    # Reduce D coefficient (default is 32, we use 12)
+                    self.bus.write("D_Coefficient", "gripper", 12)
+                    # Keep I coefficient at 0
+                    self.bus.write("I_Coefficient", "gripper", 0)
+                    # Reduce torque limits further to prevent overload
+                    self.bus.write("Max_Torque_Limit", "gripper", 400)  # 40% of max (reduced from 500)
+                    self.bus.write("Protection_Current", "gripper", 200)  # 40% of max current (reduced from 250)
+                    self.bus.write("Overload_Torque", "gripper", 20)  # 20% torque when overloaded (reduced from 25)
+                    print("    ✅ gripper configured with reduced stiffness")
+                except Exception as e:
+                    print(f"    ⚠️ Could not configure gripper (motor 6): {e}")
+        
+        print("✅ Motor configuration complete")
         
     def setup_camera(self):
         """Initialize camera connections for dual-camera setup."""
@@ -1609,6 +1765,38 @@ class ChessRobotUILLM(QMainWindow):
         """)
         QShortcut(QKeySequence("Ctrl+B"), self).activated.connect(self.start_calibration)
         control_layout.addWidget(calibrate_btn)
+        
+        # Test Motors button - move each motor a bit
+        test_motors_btn = QPushButton("TEST MOTORS")
+        test_motors_btn.setToolTip("Test each motor individually with small movements (Ctrl+T)")
+        test_motors_btn.clicked.connect(self.test_motors)
+        test_motors_btn.setStyleSheet("""
+            QPushButton {
+                background: #f0883e;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #ff9a4d;
+            }
+        """)
+        QShortcut(QKeySequence("Ctrl+T"), self).activated.connect(self.test_motors)
+        control_layout.addWidget(test_motors_btn)
+        
+        # Manual Motor Control button
+        manual_control_btn = QPushButton("MANUAL CONTROL")
+        manual_control_btn.setToolTip("Open manual motor control panel (Ctrl+M)")
+        manual_control_btn.clicked.connect(self.open_manual_control)
+        manual_control_btn.setStyleSheet("""
+            QPushButton {
+                background: #8957e5;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #a371f7;
+            }
+        """)
+        QShortcut(QKeySequence("Ctrl+M"), self).activated.connect(self.open_manual_control)
+        control_layout.addWidget(manual_control_btn)
         
         control_layout.addStretch()
         
@@ -3909,6 +4097,192 @@ Guidelines:
         except Exception as e:
             self.status_bar.setText(f"❌ Home move failed: {e}")
     
+    def test_motors(self):
+        """Test each motor individually by moving it a small amount."""
+        if not hasattr(self, 'bus') or not self.bus.is_connected:
+            self.status_bar.setText("❌ Robot not connected")
+            return
+        
+        try:
+            # Pause monitoring to avoid port conflicts
+            if hasattr(self, 'monitor_thread') and self.monitor_thread:
+                self.monitor_thread.paused = True
+                time.sleep(0.2)
+            
+            print("🧪 Testing all motors with small movements...")
+            self.status_bar.setText("🧪 Testing motors...")
+            
+            # Movement amounts (in degrees for joints, percentage for gripper)
+            test_movements = {
+                "shoulder_pan": 5.0,      # 5 degrees
+                "shoulder_lift": 5.0,     # 5 degrees
+                "elbow_flex": 5.0,        # 5 degrees
+                "wrist_flex": 5.0,         # 5 degrees
+                "wrist_roll": 10.0,       # 10 degrees (more rotation range)
+                "gripper": 5.0             # 5% (small gripper movement)
+            }
+            
+            # Read current positions (normalized)
+            current_positions = {}
+            for motor_name in self.all_motors.keys():
+                try:
+                    pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                    current_positions[motor_name] = pos
+                    print(f"  {motor_name}: current = {pos:.1f}°")
+                except Exception as e:
+                    print(f"  ⚠️ Could not read {motor_name}: {e}")
+                    current_positions[motor_name] = None
+            
+            # Test each motor
+            for motor_name in self.all_motors.keys():
+                if motor_name not in current_positions or current_positions[motor_name] is None:
+                    print(f"  ⏭️ Skipping {motor_name} (no current position - motor may not be connected)")
+                    continue
+                
+                if motor_name not in test_movements:
+                    print(f"  ⏭️ Skipping {motor_name} (no test movement defined)")
+                    continue
+                
+                movement = test_movements[motor_name]
+                current_pos = current_positions[motor_name]
+                
+                # For elbow_flex specifically, use special handling due to issues
+                # NOTE: Motor 3 is typically at its minimum position and can only move in POSITIVE direction!
+                if motor_name == "elbow_flex":
+                    print(f"\n  🔧 SPECIAL HANDLING for elbow_flex (motor 3)...")
+                    print(f"     ℹ️ Motor 3 is at minimum - can only move in POSITIVE direction")
+                    
+                    try:
+                        # Get comprehensive motor status
+                        raw_pos = self.bus.read("Present_Position", motor_name, normalize=False)
+                        norm_pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                        torque_enabled = self.bus.read("Torque_Enable", motor_name)
+                        
+                        print(f"     📊 Motor 3 Status:")
+                        print(f"        Normalized Position: {norm_pos:.1f}°")
+                        print(f"        Raw Position: {raw_pos}")
+                        print(f"        Torque Enabled: {torque_enabled}")
+                        
+                        # Enable torque first if not enabled
+                        if torque_enabled != 1:
+                            print(f"        ⚠️ Torque not enabled! Enabling...")
+                            self.bus.write("Torque_Enable", motor_name, 1)
+                            time.sleep(0.2)
+                        
+                        # Try POSITIVE direction (motor 3 is at minimum, can only go positive!)
+                        movement = 5.0  # Move 5 degrees in positive direction
+                        target_norm = norm_pos + movement
+                        
+                        print(f"\n     🔧 Attempting POSITIVE direction movement...")
+                        print(f"        Current: {norm_pos:.1f}° → Target: {target_norm:.1f}° (Δ=+{movement}°)")
+                        
+                        # Write goal position using normalized values
+                        self.bus.write("Goal_Position", motor_name, target_norm, normalize=True)
+                        print(f"        ✓ Wrote Goal_Position = {target_norm:.1f}° (normalized)")
+                        
+                        time.sleep(2.0)  # Wait for movement
+                        
+                        # Read new position
+                        new_norm_pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                        delta = new_norm_pos - norm_pos
+                        print(f"        New position: {new_norm_pos:.1f}°")
+                        print(f"        Movement: {delta:.1f}°")
+                        
+                        if abs(delta) < 1.0:
+                            print(f"     ⚠️ Motor 3 barely moved!")
+                            print(f"        Motor may be stuck or have an issue")
+                        else:
+                            print(f"     ✅ Motor 3 moved successfully ({delta:.1f}°)")
+                        
+                        # Return to original position
+                        print(f"     ↻ Returning to original position ({norm_pos:.1f}°)...")
+                        self.bus.write("Goal_Position", motor_name, norm_pos, normalize=True)
+                        time.sleep(1.5)
+                        
+                        print(f"     ✅ elbow_flex test complete")
+                        continue  # Skip the normal test flow for this motor
+                        
+                    except Exception as e:
+                        print(f"     ❌ Error during motor 3 special handling: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+                
+                target_pos = current_pos + movement
+                
+                print(f"\n  🔄 Testing {motor_name}:")
+                print(f"     Current: {current_pos:.1f}° → Target: {target_pos:.1f}° (Δ={movement:.1f}°)")
+                self.status_bar.setText(f"🧪 Testing {motor_name}...")
+                
+                try:
+                    # Move to target
+                    self.bus.write("Goal_Position", motor_name, target_pos, normalize=True)
+                    time.sleep(1.5)  # Wait for movement
+                    
+                    # Read actual position after movement
+                    try:
+                        actual_pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                        actual_movement = actual_pos - current_pos
+                        print(f"     ✅ Moved to {actual_pos:.1f}° (actual Δ={actual_movement:.1f}°)")
+                        
+                        # Check if movement was successful
+                        if abs(actual_movement) < 0.5:
+                            print(f"     ⚠️ Motor barely moved - may be stuck or overloaded")
+                            self.status_bar.setText(f"⚠️ {motor_name} barely moved")
+                        else:
+                            self.status_bar.setText(f"✅ {motor_name} moved successfully")
+                    except Exception as e:
+                        print(f"     ⚠️ Could not verify position: {e}")
+                    
+                    # Return to original position
+                    print(f"     ↻ Returning to original position...")
+                    self.bus.write("Goal_Position", motor_name, current_pos, normalize=True)
+                    time.sleep(1.5)  # Wait for return
+                    
+                    print(f"     ✅ {motor_name} test complete")
+                    
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    print(f"     ❌ Error testing {motor_name}: {e}")
+                    if "overload" in error_msg:
+                        print(f"     🔥 OVERLOAD detected on {motor_name}")
+                        self.status_bar.setText(f"🔥 {motor_name} overload detected")
+                    else:
+                        self.status_bar.setText(f"❌ {motor_name} test failed: {e}")
+                
+                time.sleep(0.5)  # Small pause between motors
+            
+            print("\n✅ Motor testing complete")
+            self.status_bar.setText("✅ Motor testing complete")
+            
+        except Exception as e:
+            print(f"❌ Motor test failed: {e}")
+            self.status_bar.setText(f"❌ Motor test failed: {e}")
+        
+        finally:
+            # Resume monitoring
+            if hasattr(self, 'monitor_thread') and self.monitor_thread:
+                self.monitor_thread.paused = False
+                print("▶️ Monitoring resumed")
+    
+    def open_manual_control(self):
+        """Open the manual motor control dialog."""
+        if not hasattr(self, 'bus') or not self.bus.is_connected:
+            self.status_bar.setText("❌ Robot not connected")
+            return
+        
+        # Pause monitoring during manual control
+        if hasattr(self, 'monitor_thread') and self.monitor_thread:
+            self.monitor_thread.paused = True
+        
+        try:
+            dialog = ManualMotorControlDialog(self.bus, self.all_motors, self)
+            dialog.exec()
+        finally:
+            # Resume monitoring after dialog closes
+            if hasattr(self, 'monitor_thread') and self.monitor_thread:
+                self.monitor_thread.paused = False
+    
     def refresh_status(self):
         """Force refresh of all displays."""
         self.status_bar.setText("🔄 Refreshing all systems...")
@@ -4199,6 +4573,512 @@ Guidelines:
             self.status_bar.setStyleSheet("color: #f0883e;")
             print(f"> File changed: {path}")
             print("  Please restart the app manually to see changes.")
+
+
+class ManualMotorControlDialog(QDialog):
+    """Dialog for manual motor control with sliders and direct position input."""
+    
+    def __init__(self, bus, motors, parent=None):
+        super().__init__(parent)
+        self.bus = bus
+        self.motors = motors
+        self.parent_window = parent
+        self.setWindowTitle("Manual Motor Control")
+        self.setMinimumSize(800, 700)
+        self.setStyleSheet("""
+            QDialog {
+                background: #0d1117;
+                color: #c9d1d9;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                margin-top: 12px;
+                padding-top: 10px;
+                background: #161b22;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+            QLabel {
+                color: #c9d1d9;
+            }
+            QSlider::groove:horizontal {
+                height: 8px;
+                background: #21262d;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #58a6ff;
+                width: 18px;
+                margin: -5px 0;
+                border-radius: 9px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #79c0ff;
+            }
+            QPushButton {
+                background: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #30363d;
+                border-color: #8b949e;
+            }
+            QPushButton:pressed {
+                background: #0d1117;
+            }
+            QSpinBox, QDoubleSpinBox {
+                background: #0d1117;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+        """)
+        
+        self.setup_ui()
+        self.start_position_updates()
+    
+    def setup_ui(self):
+        """Create the manual control UI."""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Title
+        title = QLabel("🎮 Manual Motor Control")
+        title.setStyleSheet("font-size: 18pt; font-weight: bold; color: #58a6ff;")
+        layout.addWidget(title)
+        
+        # Instructions
+        instructions = QLabel("Move sliders or enter values to control each motor. Use RAW mode for direct position control.")
+        instructions.setStyleSheet("color: #8b949e; font-size: 10pt;")
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        
+        # Scroll area for motor controls
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        scroll_layout.setSpacing(15)
+        
+        # Motor controls storage
+        self.motor_controls = {}
+        
+        # Create controls for each motor
+        motor_configs = {
+            "shoulder_pan": {"min": -180, "max": 180, "unit": "°", "color": "#e74c3c"},
+            "shoulder_lift": {"min": -180, "max": 180, "unit": "°", "color": "#e67e22"},
+            "elbow_flex": {"min": -180, "max": 180, "unit": "°", "color": "#f1c40f"},
+            "wrist_flex": {"min": -180, "max": 180, "unit": "°", "color": "#2ecc71"},
+            "wrist_roll": {"min": -180, "max": 180, "unit": "°", "color": "#3498db"},
+            "gripper": {"min": 0, "max": 100, "unit": "%", "color": "#9b59b6"},
+        }
+        
+        for motor_name in self.motors.keys():
+            config = motor_configs.get(motor_name, {"min": -180, "max": 180, "unit": "°", "color": "#58a6ff"})
+            motor_group = self.create_motor_control(motor_name, config)
+            scroll_layout.addWidget(motor_group)
+        
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll, 1)
+        
+        # Bottom buttons
+        button_layout = QHBoxLayout()
+        
+        # All torque toggle
+        self.torque_all_btn = QPushButton("🔌 DISABLE ALL TORQUE")
+        self.torque_all_btn.clicked.connect(self.toggle_all_torque)
+        self.torque_all_btn.setStyleSheet("""
+            QPushButton {
+                background: #da3633;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #f85149;
+            }
+        """)
+        button_layout.addWidget(self.torque_all_btn)
+        
+        # Refresh button
+        refresh_btn = QPushButton("🔄 REFRESH POSITIONS")
+        refresh_btn.clicked.connect(self.refresh_all_positions)
+        button_layout.addWidget(refresh_btn)
+        
+        # Center all button
+        center_btn = QPushButton("🎯 CENTER ALL")
+        center_btn.clicked.connect(self.center_all_motors)
+        center_btn.setStyleSheet("""
+            QPushButton {
+                background: #1f6feb;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #388bfd;
+            }
+        """)
+        button_layout.addWidget(center_btn)
+        
+        button_layout.addStretch()
+        
+        # Close button
+        close_btn = QPushButton("✖ CLOSE")
+        close_btn.clicked.connect(self.accept)
+        button_layout.addWidget(close_btn)
+        
+        layout.addLayout(button_layout)
+    
+    def create_motor_control(self, motor_name: str, config: dict) -> QGroupBox:
+        """Create control group for a single motor."""
+        group = QGroupBox(f"Motor: {motor_name}")
+        group.setStyleSheet(f"""
+            QGroupBox {{
+                border: 2px solid {config['color']};
+                border-radius: 8px;
+            }}
+            QGroupBox::title {{
+                color: {config['color']};
+            }}
+        """)
+        
+        layout = QVBoxLayout(group)
+        layout.setSpacing(10)
+        
+        # Row 1: Current position display
+        pos_row = QHBoxLayout()
+        
+        pos_label = QLabel("Position:")
+        pos_label.setStyleSheet("font-weight: bold;")
+        pos_row.addWidget(pos_label)
+        
+        norm_pos_label = QLabel("--")
+        norm_pos_label.setStyleSheet(f"color: {config['color']}; font-size: 14pt; font-weight: bold; min-width: 80px;")
+        pos_row.addWidget(norm_pos_label)
+        
+        pos_row.addWidget(QLabel(config['unit']))
+        
+        pos_row.addSpacing(20)
+        
+        pos_row.addWidget(QLabel("Raw:"))
+        raw_pos_label = QLabel("--")
+        raw_pos_label.setStyleSheet("color: #8b949e; min-width: 60px;")
+        pos_row.addWidget(raw_pos_label)
+        
+        pos_row.addStretch()
+        
+        # Torque indicator
+        torque_label = QLabel("⚡ ON")
+        torque_label.setStyleSheet("color: #3fb950; font-weight: bold;")
+        pos_row.addWidget(torque_label)
+        
+        layout.addLayout(pos_row)
+        
+        # Row 2: Slider control
+        slider_row = QHBoxLayout()
+        
+        slider = QSlider(Qt.Horizontal)
+        slider.setMinimum(int(config['min'] * 10))  # Use 0.1 degree precision
+        slider.setMaximum(int(config['max'] * 10))
+        slider.setValue(0)
+        slider.setTickPosition(QSlider.TicksBelow)
+        slider.setTickInterval(int((config['max'] - config['min']) * 10 / 10))
+        slider_row.addWidget(slider, 1)
+        
+        layout.addLayout(slider_row)
+        
+        # Row 3: Direct input controls
+        input_row = QHBoxLayout()
+        
+        input_row.addWidget(QLabel("Target:"))
+        
+        # Normalized input
+        norm_spin = QDoubleSpinBox()
+        norm_spin.setRange(config['min'], config['max'])
+        norm_spin.setDecimals(1)
+        norm_spin.setSuffix(f" {config['unit']}")
+        norm_spin.setMinimumWidth(100)
+        input_row.addWidget(norm_spin)
+        
+        # Go button for normalized
+        go_norm_btn = QPushButton("GO")
+        go_norm_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {config['color']};
+                color: white;
+                padding: 4px 12px;
+            }}
+        """)
+        go_norm_btn.clicked.connect(lambda: self.move_motor_normalized(motor_name, norm_spin.value()))
+        input_row.addWidget(go_norm_btn)
+        
+        input_row.addSpacing(20)
+        
+        # Raw input
+        input_row.addWidget(QLabel("Raw:"))
+        raw_spin = QSpinBox()
+        raw_spin.setRange(0, 4095)
+        raw_spin.setMinimumWidth(80)
+        input_row.addWidget(raw_spin)
+        
+        # Go button for raw
+        go_raw_btn = QPushButton("GO RAW")
+        go_raw_btn.setStyleSheet("""
+            QPushButton {
+                background: #f0883e;
+                color: white;
+                padding: 4px 12px;
+            }
+        """)
+        go_raw_btn.clicked.connect(lambda: self.move_motor_raw(motor_name, raw_spin.value()))
+        input_row.addWidget(go_raw_btn)
+        
+        input_row.addStretch()
+        
+        # Toggle torque button
+        torque_btn = QPushButton("Toggle Torque")
+        torque_btn.clicked.connect(lambda: self.toggle_motor_torque(motor_name))
+        input_row.addWidget(torque_btn)
+        
+        layout.addLayout(input_row)
+        
+        # Row 4: Quick actions
+        quick_row = QHBoxLayout()
+        
+        # Nudge buttons
+        nudge_minus_10 = QPushButton("-10")
+        nudge_minus_10.clicked.connect(lambda: self.nudge_motor(motor_name, -10))
+        quick_row.addWidget(nudge_minus_10)
+        
+        nudge_minus_5 = QPushButton("-5")
+        nudge_minus_5.clicked.connect(lambda: self.nudge_motor(motor_name, -5))
+        quick_row.addWidget(nudge_minus_5)
+        
+        nudge_minus_1 = QPushButton("-1")
+        nudge_minus_1.clicked.connect(lambda: self.nudge_motor(motor_name, -1))
+        quick_row.addWidget(nudge_minus_1)
+        
+        nudge_plus_1 = QPushButton("+1")
+        nudge_plus_1.clicked.connect(lambda: self.nudge_motor(motor_name, 1))
+        quick_row.addWidget(nudge_plus_1)
+        
+        nudge_plus_5 = QPushButton("+5")
+        nudge_plus_5.clicked.connect(lambda: self.nudge_motor(motor_name, 5))
+        quick_row.addWidget(nudge_plus_5)
+        
+        nudge_plus_10 = QPushButton("+10")
+        nudge_plus_10.clicked.connect(lambda: self.nudge_motor(motor_name, 10))
+        quick_row.addWidget(nudge_plus_10)
+        
+        quick_row.addStretch()
+        
+        # Raw nudge buttons (for debugging motor 3)
+        quick_row.addWidget(QLabel("Raw:"))
+        
+        raw_minus_100 = QPushButton("-100")
+        raw_minus_100.setStyleSheet("background: #21262d;")
+        raw_minus_100.clicked.connect(lambda: self.nudge_motor_raw(motor_name, -100))
+        quick_row.addWidget(raw_minus_100)
+        
+        raw_plus_100 = QPushButton("+100")
+        raw_plus_100.setStyleSheet("background: #21262d;")
+        raw_plus_100.clicked.connect(lambda: self.nudge_motor_raw(motor_name, 100))
+        quick_row.addWidget(raw_plus_100)
+        
+        layout.addLayout(quick_row)
+        
+        # Store controls for this motor
+        self.motor_controls[motor_name] = {
+            "norm_pos_label": norm_pos_label,
+            "raw_pos_label": raw_pos_label,
+            "torque_label": torque_label,
+            "slider": slider,
+            "norm_spin": norm_spin,
+            "raw_spin": raw_spin,
+            "config": config,
+        }
+        
+        # Connect slider to movement
+        slider.sliderReleased.connect(lambda m=motor_name: self.slider_released(m))
+        
+        return group
+    
+    def start_position_updates(self):
+        """Start timer to update position displays."""
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.update_positions)
+        self.update_timer.start(200)  # Update 5 times per second
+        self.update_positions()  # Initial update
+    
+    def update_positions(self):
+        """Update all motor position displays."""
+        for motor_name, controls in self.motor_controls.items():
+            try:
+                # Read normalized position
+                norm_pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                controls["norm_pos_label"].setText(f"{norm_pos:.1f}")
+                
+                # Update slider (without triggering signal)
+                controls["slider"].blockSignals(True)
+                controls["slider"].setValue(int(norm_pos * 10))
+                controls["slider"].blockSignals(False)
+                
+                # Read raw position
+                raw_pos = self.bus.read("Present_Position", motor_name, normalize=False)
+                controls["raw_pos_label"].setText(str(raw_pos))
+                controls["raw_spin"].setValue(raw_pos)
+                
+                # Update torque status
+                try:
+                    torque = self.bus.read("Torque_Enable", motor_name)
+                    if torque == 1:
+                        controls["torque_label"].setText("⚡ ON")
+                        controls["torque_label"].setStyleSheet("color: #3fb950; font-weight: bold;")
+                    else:
+                        controls["torque_label"].setText("⚡ OFF")
+                        controls["torque_label"].setStyleSheet("color: #f85149; font-weight: bold;")
+                except:
+                    pass
+                
+            except Exception as e:
+                controls["norm_pos_label"].setText("ERR")
+                controls["raw_pos_label"].setText("ERR")
+    
+    def slider_released(self, motor_name: str):
+        """Handle slider release - move motor to slider position."""
+        controls = self.motor_controls[motor_name]
+        target = controls["slider"].value() / 10.0
+        self.move_motor_normalized(motor_name, target)
+    
+    def move_motor_normalized(self, motor_name: str, target: float):
+        """Move motor to normalized position."""
+        try:
+            print(f"🎯 Moving {motor_name} to {target:.1f}° (normalized)")
+            self.bus.write("Goal_Position", motor_name, target, normalize=True)
+        except Exception as e:
+            print(f"❌ Error moving {motor_name}: {e}")
+    
+    def move_motor_raw(self, motor_name: str, raw_target: int):
+        """Move motor to raw position."""
+        try:
+            print(f"🎯 Moving {motor_name} to {raw_target} (RAW)")
+            self.bus.write("Goal_Position", motor_name, raw_target, normalize=False)
+        except Exception as e:
+            print(f"❌ Error moving {motor_name}: {e}")
+    
+    def nudge_motor(self, motor_name: str, delta: float):
+        """Nudge motor by delta degrees."""
+        try:
+            current = self.bus.read("Present_Position", motor_name, normalize=True)
+            target = current + delta
+            print(f"🔧 Nudging {motor_name}: {current:.1f}° + {delta}° = {target:.1f}°")
+            self.bus.write("Goal_Position", motor_name, target, normalize=True)
+        except Exception as e:
+            print(f"❌ Error nudging {motor_name}: {e}")
+    
+    def nudge_motor_raw(self, motor_name: str, delta: int):
+        """Nudge motor by delta raw units."""
+        try:
+            current = self.bus.read("Present_Position", motor_name, normalize=False)
+            target = current + delta
+            print(f"🔧 Nudging {motor_name} RAW: {current} + {delta} = {target}")
+            self.bus.write("Goal_Position", motor_name, target, normalize=False)
+        except Exception as e:
+            print(f"❌ Error nudging {motor_name} (raw): {e}")
+    
+    def toggle_motor_torque(self, motor_name: str):
+        """Toggle torque for a single motor."""
+        try:
+            current = self.bus.read("Torque_Enable", motor_name)
+            new_state = 0 if current == 1 else 1
+            self.bus.write("Torque_Enable", motor_name, new_state)
+            print(f"⚡ {motor_name} torque: {'ON' if new_state else 'OFF'}")
+        except Exception as e:
+            print(f"❌ Error toggling torque for {motor_name}: {e}")
+    
+    def toggle_all_torque(self):
+        """Toggle torque for all motors."""
+        try:
+            # Check if any motor has torque enabled
+            any_enabled = False
+            for motor_name in self.motors.keys():
+                try:
+                    if self.bus.read("Torque_Enable", motor_name) == 1:
+                        any_enabled = True
+                        break
+                except:
+                    pass
+            
+            # Toggle all motors
+            new_state = 0 if any_enabled else 1
+            for motor_name in self.motors.keys():
+                try:
+                    self.bus.write("Torque_Enable", motor_name, new_state)
+                except:
+                    pass
+            
+            # Update button text
+            if new_state == 0:
+                self.torque_all_btn.setText("🔌 ENABLE ALL TORQUE")
+                self.torque_all_btn.setStyleSheet("""
+                    QPushButton {
+                        background: #238636;
+                        color: white;
+                    }
+                    QPushButton:hover {
+                        background: #2ea043;
+                    }
+                """)
+            else:
+                self.torque_all_btn.setText("🔌 DISABLE ALL TORQUE")
+                self.torque_all_btn.setStyleSheet("""
+                    QPushButton {
+                        background: #da3633;
+                        color: white;
+                    }
+                    QPushButton:hover {
+                        background: #f85149;
+                    }
+                """)
+            
+            print(f"⚡ All motors torque: {'ON' if new_state else 'OFF'}")
+        except Exception as e:
+            print(f"❌ Error toggling all torque: {e}")
+    
+    def refresh_all_positions(self):
+        """Force refresh all position displays."""
+        self.update_positions()
+        print("🔄 Positions refreshed")
+    
+    def center_all_motors(self):
+        """Move all motors to center position (0 degrees or 50%)."""
+        for motor_name in self.motors.keys():
+            try:
+                if motor_name == "gripper":
+                    target = 50  # 50% for gripper
+                else:
+                    target = 0  # 0 degrees for joints
+                self.bus.write("Goal_Position", motor_name, target, normalize=True)
+                time.sleep(0.3)
+            except Exception as e:
+                print(f"❌ Error centering {motor_name}: {e}")
+        print("🎯 All motors centered")
+    
+    def closeEvent(self, event):
+        """Clean up when dialog closes."""
+        if hasattr(self, 'update_timer'):
+            self.update_timer.stop()
+        super().closeEvent(event)
 
 
 def main():
