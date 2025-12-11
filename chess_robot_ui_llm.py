@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QGroupBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox, QFrame, QToolTip, QScrollArea,
     QTextEdit, QLineEdit, QPlainTextEdit, QSizePolicy, QCheckBox, QSpinBox,
-    QDialog, QSlider, QDoubleSpinBox
+    QDialog, QSlider, QDoubleSpinBox, QListWidget, QMessageBox
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QFileSystemWatcher
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush, QFont, QKeySequence, QShortcut
@@ -701,31 +701,15 @@ class MonitoringThread(QThread):
             while self.running:
                 iteration += 1
                 
-                # Update main camera (every iteration for smooth video)
-                try:
-                    main_cam = self.cameras.get("main")
-                    if main_cam and main_cam.is_connected:
-                        frame = main_cam.read()
-                        if frame is not None and frame.size > 0:
-                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            frame_resized = cv2.resize(frame_rgb, (640, 360))  # 16:9 for main camera
-                            
-                            height, width, channel = frame_resized.shape
-                            bytes_per_line = 3 * width
-                            q_image = QImage(frame_resized.data, width, height, bytes_per_line, QImage.Format_RGB888)
-                            pixmap = QPixmap.fromImage(q_image)
-                            self.main_camera_update.emit(pixmap)
-                except Exception as e:
-                    pass
-                
                 # Update gripper camera (every iteration for smooth video)
                 try:
                     gripper_cam = self.cameras.get("gripper")
                     if gripper_cam and gripper_cam.is_connected:
                         frame = gripper_cam.read()
                         if frame is not None and frame.size > 0:
+                            # Convert BGR to RGB for Qt display
                             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            frame_resized = cv2.resize(frame_rgb, (320, 240))  # 4:3 for gripper camera
+                            frame_resized = cv2.resize(frame_rgb, (640, 480))  # Larger display
                             
                             height, width, channel = frame_resized.shape
                             bytes_per_line = 3 * width
@@ -1129,35 +1113,26 @@ class ChessRobotUILLM(QMainWindow):
         print("✅ Motor configuration complete")
         
     def setup_camera(self):
-        """Initialize camera connections for dual-camera setup."""
-        # Main camera (iPhone or fixed overhead camera)
-        # For iPhone via USB: use index 1 or 2 (try different indices)
-        # For iPhone via network: use RTSP URL like "rtsp://192.168.x.x:8080/h264_ulaw.sdp"
-        main_camera_cfg = OpenCVCameraConfig(
-            index_or_path=0,  # Change to 1, 2, or RTSP URL for iPhone
-            width=1280,       # Higher resolution for main overview
-            height=720,
-            fps=30
-        )
-        self.main_camera = OpenCVCamera(main_camera_cfg)
-        
-        # Gripper-mounted camera for precision "last mile" control
+        """Initialize camera connection for gripper camera only."""
+        # Gripper-mounted camera for precision control and vision
         gripper_camera_cfg = OpenCVCameraConfig(
-            index_or_path=1,  # Adjust based on your USB camera index
-            width=640,        # Lower resolution is fine for gripper cam
+            index_or_path=0,
+            width=640,
             height=480,
             fps=30
         )
         self.gripper_camera = OpenCVCamera(gripper_camera_cfg)
         
+        # No main camera
+        self.main_camera = None
+        
         # Store in dict for easier management (following lerobot pattern)
         self.cameras = {
-            "main": self.main_camera,
             "gripper": self.gripper_camera
         }
         
         # Maintain backwards compatibility with single camera reference
-        self.camera = self.main_camera
+        self.camera = self.gripper_camera
     
     def setup_kinematics(self):
         """Initialize robot kinematics for forward kinematics calculations."""
@@ -1317,45 +1292,24 @@ class ChessRobotUILLM(QMainWindow):
         self.create_control_panel(main_layout)
         
     def create_camera_panel(self, parent_layout):
-        """Create dual camera view panels."""
-        # Container for both cameras
+        """Create camera view panel (gripper camera only)."""
+        # Container for camera
         cameras_container = QWidget()
         cameras_layout = QVBoxLayout(cameras_container)
         cameras_layout.setSpacing(8)
         cameras_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Main camera panel (iPhone/Overview)
-        main_camera_group = QGroupBox("Main Camera [Overview]")
-        main_camera_group.setToolTip("Main overview camera - shows entire chess board and robot setup")
-        main_camera_layout = QVBoxLayout(main_camera_group)
-        main_camera_layout.setSpacing(6)
-        main_camera_layout.setContentsMargins(8, 8, 8, 8)
-        
-        self.main_camera_label = QLabel("Initializing main camera...")
-        self.main_camera_label.setAlignment(Qt.AlignCenter)
-        self.main_camera_label.setMinimumSize(320, 180)
-        self.main_camera_label.setMaximumSize(640, 360)
-        self.main_camera_label.setScaledContents(True)
-        main_camera_layout.addWidget(self.main_camera_label)
-        
-        self.main_camera_status = QLabel("[CONNECTING]")
-        self.main_camera_status.setStyleSheet("color: #f0883e;")
-        self.main_camera_status.setAlignment(Qt.AlignCenter)
-        main_camera_layout.addWidget(self.main_camera_status)
-        
-        cameras_layout.addWidget(main_camera_group)
-        
-        # Gripper camera panel (Last Mile)
-        gripper_camera_group = QGroupBox("Gripper Camera [Last Mile]")
-        gripper_camera_group.setToolTip("Gripper-mounted camera - for precision piece pickup and placement")
+        # Gripper camera panel - now the primary camera
+        gripper_camera_group = QGroupBox("Camera [Gripper View]")
+        gripper_camera_group.setToolTip("Gripper-mounted camera - for vision and precision control")
         gripper_camera_layout = QVBoxLayout(gripper_camera_group)
         gripper_camera_layout.setSpacing(6)
         gripper_camera_layout.setContentsMargins(8, 8, 8, 8)
         
-        self.gripper_camera_label = QLabel("Initializing gripper camera...")
+        self.gripper_camera_label = QLabel("Initializing camera...")
         self.gripper_camera_label.setAlignment(Qt.AlignCenter)
-        self.gripper_camera_label.setMinimumSize(320, 240)
-        self.gripper_camera_label.setMaximumSize(320, 240)
+        self.gripper_camera_label.setMinimumSize(480, 360)
+        self.gripper_camera_label.setMaximumSize(640, 480)
         self.gripper_camera_label.setScaledContents(True)
         gripper_camera_layout.addWidget(self.gripper_camera_label)
         
@@ -1366,8 +1320,12 @@ class ChessRobotUILLM(QMainWindow):
         
         cameras_layout.addWidget(gripper_camera_group)
         
-        # FPS counter for both cameras
-        self.fps_label = QLabel("FPS: Main: -- | Gripper: --")
+        # Dummy main camera labels (for compatibility - not displayed)
+        self.main_camera_label = QLabel()
+        self.main_camera_status = QLabel()
+        
+        # FPS counter
+        self.fps_label = QLabel("FPS: --")
         self.fps_label.setStyleSheet("color: #7d8590; font-size: 9pt;")
         self.fps_label.setAlignment(Qt.AlignCenter)
         cameras_layout.addWidget(self.fps_label)
@@ -1798,6 +1756,22 @@ class ChessRobotUILLM(QMainWindow):
         QShortcut(QKeySequence("Ctrl+M"), self).activated.connect(self.open_manual_control)
         control_layout.addWidget(manual_control_btn)
         
+        # Position Calibration button
+        positions_btn = QPushButton("POSITIONS")
+        positions_btn.setToolTip("Save and recall arm positions (Ctrl+P)")
+        positions_btn.clicked.connect(self.open_position_calibration)
+        positions_btn.setStyleSheet("""
+            QPushButton {
+                background: #238636;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #2ea043;
+            }
+        """)
+        QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self.open_position_calibration)
+        control_layout.addWidget(positions_btn)
+        
         control_layout.addStretch()
         
         stop_btn = QPushButton("STOP")
@@ -2197,9 +2171,9 @@ class ChessRobotUILLM(QMainWindow):
         camera_row = QHBoxLayout()
         camera_row.addWidget(QLabel("Camera:"))
         self.vision_camera_combo = QComboBox()
-        self.vision_camera_combo.addItems(["Main Camera", "Gripper Camera", "Both Cameras"])
-        self.vision_camera_combo.setCurrentText("Main Camera")
-        self.vision_camera_combo.setToolTip("Select which camera(s) to send to LLM")
+        self.vision_camera_combo.addItems(["Gripper Camera"])
+        self.vision_camera_combo.setCurrentText("Gripper Camera")
+        self.vision_camera_combo.setToolTip("Camera to send to LLM for vision")
         camera_row.addWidget(self.vision_camera_combo)
         
         # Image size selection
@@ -2347,41 +2321,46 @@ class ChessRobotUILLM(QMainWindow):
                 w, h = map(int, resolution.split('x'))
                 target_size = (w, h)
             
-            def encode_frame(camera):
-                """Helper to encode a single camera frame."""
-                if not camera or not camera.is_connected:
-                    return None
-                
-                frame = camera.read()
-                if frame is None:
-                    return None
-                
-                # Resize if needed
-                if target_size:
-                    frame = cv2.resize(frame, target_size)
-                
-                # Convert BGR to RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Encode to JPEG
-                _, buffer = cv2.imencode('.jpg', frame_rgb, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                
-                # Convert to base64
-                img_base64 = base64.b64encode(buffer).decode('utf-8')
-                return img_base64
+            # Capture from gripper camera (the only camera now)
+            print(f"📸 Capturing image from gripper camera")
             
-            # Capture based on selection
-            if camera_source == "main":
-                return encode_frame(self.main_camera)
-            elif camera_source == "gripper":
-                return encode_frame(self.gripper_camera)
-            elif camera_source == "both":
-                main_img = encode_frame(self.main_camera)
-                gripper_img = encode_frame(self.gripper_camera)
-                return [main_img, gripper_img] if main_img and gripper_img else None
+            if not self.gripper_camera:
+                print(f"   ⚠️ Gripper camera object is None")
+                return None
+            if not self.gripper_camera.is_connected:
+                print(f"   ⚠️ Gripper camera not connected")
+                return None
+            
+            frame = self.gripper_camera.read()
+            if frame is None:
+                print(f"   ⚠️ Gripper camera returned None frame")
+                return None
+            
+            original_shape = frame.shape
+            
+            # Resize if needed
+            if target_size:
+                frame = cv2.resize(frame, target_size)
+            
+            # Convert BGR to RGB for proper JPEG colors
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Encode to JPEG
+            success, buffer = cv2.imencode('.jpg', frame_rgb, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            
+            if not success:
+                print(f"   ⚠️ Gripper camera JPEG encoding failed")
+                return None
+            
+            # Convert to base64
+            img_base64 = base64.b64encode(buffer).decode('utf-8')
+            print(f"   ✅ Gripper camera: captured {original_shape} -> {frame.shape if target_size else 'original'}, {len(img_base64)//1024}KB")
+            return img_base64
             
         except Exception as e:
             print(f"⚠️ Failed to capture camera image: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def toggle_vision_auto_update(self, enabled):
@@ -2611,7 +2590,7 @@ class ChessRobotUILLM(QMainWindow):
         
         # Track iteration history
         iteration_history = []
-        max_iterations = 10  # Safety limit
+        max_iterations = 25  # Increased to allow more attempts to reach goal
         iteration = 0
         consecutive_failures = 0  # Track repeated failures to detect stuck state
         last_action_hash = None  # Track if we're repeating the same action
@@ -2702,10 +2681,10 @@ class ChessRobotUILLM(QMainWindow):
                     iteration_history.append({"iteration": iteration, "status": "execution_failed", "action": llm_output, "error": error_msg})
                     consecutive_failures += 1
                     
-                    # If overload detected, add extra cool-down pause
+                    # If overload detected, add extra cool-down pause - this is critical for motor safety
                     if "overload" in error_msg.lower():
-                        emit_status(f"⏸️ Overload detected - pausing 3 seconds before retry...")
-                        time.sleep(3.0)
+                        emit_status(f"⏸️ OVERLOAD detected - pausing 5 seconds before retry...")
+                        time.sleep(5.0)  # Increased for motor safety
                     
                     # Stop if too many consecutive failures
                     if consecutive_failures >= 3:
@@ -2745,15 +2724,16 @@ class ChessRobotUILLM(QMainWindow):
                 
                 # Detect repeated large movements (could cause overheating)
                 if len(movement_history) >= 2:
-                    recent_large_movements = sum(1 for m in movement_history[-2:] if m > 15.0)
-                    if recent_large_movements >= 2:
-                        emit_status(f"⚠️ Multiple large movements detected - adding cool-down pause...")
+                    # Only pause for very large movements (increased threshold)
+                    recent_large_movements = sum(1 for m in movement_history[-3:] if m > 30.0)
+                    if recent_large_movements >= 3:
+                        emit_status(f"⚠️ Multiple large movements detected - brief pause...")
                         current_reasoning = thread._reasoning_text if thread and hasattr(thread, '_reasoning_text') else ""
                         emit_reasoning(
                             current_reasoning + 
-                            f"\n⚠️ Multiple large movements detected (last 2: {movement_history[-2]:.1f}°, {movement_history[-1]:.1f}°) - pausing 2s for motor safety\n"
+                            f"\n⚠️ Multiple large movements detected - brief pause for motor safety\n"
                         )
-                        time.sleep(2.0)  # Cool-down pause
+                        time.sleep(0.5)  # Reduced cool-down pause
                 
                 if total_change < 2.0:  # Less than 2 degrees total change = stuck
                     consecutive_failures += 1
@@ -2802,10 +2782,10 @@ class ChessRobotUILLM(QMainWindow):
                     emit_status(f"🔄 Iteration {iteration} complete. Goal not yet reached. Planning next action...")
                     # Add delay between iterations to prevent motor overheating
                     # Longer delay if we just made a large movement
-                    if total_change > 15.0:
-                        time.sleep(2.0)  # Longer pause after large movements
+                    if total_change > 30.0:
+                        time.sleep(0.8)  # Brief pause after large movements
                     else:
-                        time.sleep(1.0)  # Standard pause between iterations
+                        time.sleep(0.5)  # Reduced pause between iterations
             
             if iteration >= max_iterations:
                 emit_status(f"⚠️ Reached max iterations ({max_iterations}). Goal may not be fully achieved.")
@@ -2893,26 +2873,38 @@ Output either a single action or a short sequence (1-3 steps max per iteration).
             
             # Build messages
             if image_data:
+                # Count and log images being sent
+                if isinstance(image_data, list):
+                    valid_images = [img for img in image_data if img]
+                    img_sizes = [len(img) // 1024 for img in valid_images]  # Size in KB
+                    print(f"📷 Sending {len(valid_images)} image(s) to LLM: {img_sizes} KB each")
+                else:
+                    img_size = len(image_data) // 1024
+                    print(f"📷 Sending 1 image to LLM: {img_size} KB")
+                
                 user_content = [{"type": "text", "text": full_prompt}]
                 if isinstance(image_data, list):
-                    for img in image_data:
+                    for i, img in enumerate(image_data):
                         if img:
                             user_content.append({
                                 "type": "image_url",
                                 "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "high"}
                             })
+                            print(f"   📎 Image {i+1} attached (base64 length: {len(img)})")
                 else:
                     if image_data:
                         user_content.append({
                             "type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{image_data}", "detail": "high"}
                         })
+                        print(f"   📎 Image attached (base64 length: {len(image_data)})")
                 
                 messages = [
                     {"role": "system", "content": "You are a robot control assistant. Analyze the current state and plan the next action toward the goal. Output only valid JSON."},
                     {"role": "user", "content": user_content}
                 ]
             else:
+                print("📷 No image data - sending text-only request to LLM")
                 messages = [
                     {"role": "system", "content": "You are a robot control assistant. Analyze the current state and plan the next action toward the goal. Output only valid JSON."},
                     {"role": "user", "content": full_prompt}
@@ -3076,6 +3068,17 @@ Examples:
         # Default: be conservative without vision
         return False, "Goal status unknown without vision; continue iterations."
     
+    def _load_saved_positions(self) -> dict:
+        """Load saved positions from file for LLM context."""
+        positions_file = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower/saved_positions.json"
+        if positions_file.exists():
+            try:
+                with open(positions_file) as f:
+                    return json.load(f)
+            except:
+                pass
+        return {}
+    
     def _build_llm_prompt(self, command: str, current_positions: Dict[str, float]) -> str:
         """Build prompt for LLM with robot context and position model."""
         # Update position model before building prompt
@@ -3109,6 +3112,24 @@ Chess Board Calibration:
   * shoulder_lift = reference_lift + (rank_index * degrees_per_rank)
   * file_index: a=0, b=1, c=2, d=3, e=4, f=5, g=6, h=7
   * rank_index: 1=0, 2=1, 3=2, 4=3, 5=4, 6=5, 7=6, 8=7
+"""
+        
+        # Load saved/calibrated positions for reference
+        saved_positions = self._load_saved_positions()
+        saved_positions_context = ""
+        if saved_positions:
+            saved_positions_context = "\n\nSAVED/CALIBRATED POSITIONS (use these as reference waypoints):\n"
+            for name, data in saved_positions.items():
+                desc = data.get("description", "")
+                positions = data.get("positions", {})
+                pos_str = ", ".join([f"{k}:{v:.1f}°" if k != "gripper" else f"{k}:{v:.1f}%" for k, v in positions.items()])
+                saved_positions_context += f"- '{name}': {desc}\n  Joint values: {pos_str}\n"
+            saved_positions_context += """
+You can use these saved positions to:
+1. GO TO a named position directly (e.g., "go to home", "move to overview")
+2. INTERPOLATE between positions for smooth movement
+3. Use as WAYPOINTS in multi-step sequences
+4. Reference them when calculating new positions
 """
         
         prompt = f"""You control a 5-DOF robot arm for chess piece manipulation.
@@ -3149,7 +3170,7 @@ CURRENT ROBOT STATE:
 - Joint positions: {json.dumps(current_positions, indent=2)}
 - End-effector position: x={ee_x:.1f}mm, y={ee_y:.1f}mm, z={ee_z:.1f}mm
 - Gripper state: {self.position_model.get('gripper', 0):.1f}%
-{board_context}
+{board_context}{saved_positions_context}
 USER COMMAND: {command}
 
 CAPABILITIES:
@@ -3180,25 +3201,25 @@ For sequences (REQUIRED for "find X" or "go to X" tasks):
       "step": 1,
       "action": {{"shoulder_pan.pos": 0.0, "shoulder_lift.pos": 40.0, "elbow_flex.pos": 40.0, "wrist_flex.pos": -30.0}},
       "description": "Move to OVERVIEW position - raise arm to see full board",
-      "wait_after": 1.5
+      "wait_after": 0.8
     }},
     {{
       "step": 2,
       "action": {{"shoulder_pan.pos": -20.0, "shoulder_lift.pos": 20.0}},
       "description": "Pan toward left side of board where a-file is located",
-      "wait_after": 1.0
+      "wait_after": 0.5
     }},
     {{
       "step": 3,
       "action": {{"shoulder_lift.pos": -20.0, "elbow_flex.pos": -20.0}},
       "description": "Lower arm toward board to get closer to target",
-      "wait_after": 1.0
+      "wait_after": 0.5
     }},
     {{
       "step": 4,
       "action": {{"shoulder_lift.pos": -50.0, "elbow_flex.pos": -50.0, "wrist_flex.pos": 0.0}},
       "description": "Final approach - lower gripper to touch target square",
-      "wait_after": 1.0
+      "wait_after": 0.5
     }}
   ],
   "explanation": "Plan: 1) Raise to overview to see board, 2) Pan toward a-file, 3) Lower incrementally, 4) Touch target"
@@ -3216,19 +3237,21 @@ CRITICAL RULES:
 3. Move to overview FIRST (shoulder_lift ~40°, elbow_flex ~40°, wrist_flex ~-30°)
 4. Then pan/tilt to find target visually
 5. Then lower incrementally to approach
-6. Keep step changes reasonable (15-30° per motor per step is OK for planned sequences)
-7. Use wait_after 1.0-1.5s for large movements, 0.5-1.0s for small adjustments
+6. You can make larger movements (up to 40° per motor per step) - system will handle overload detection
+7. Use wait_after 0.5-1.0s for movements
+8. You have up to 25 iterations to reach the goal - be methodical and make progress each step
+9. A fresh camera image is captured before each iteration - use it to verify progress
 """
         return prompt
     
     def _validate_llm_action(self, action: Dict[str, Any], current_positions: Dict[str, float], 
-                              max_change: float = 15.0, is_sequence_step: bool = False) -> Optional[Dict[str, float]]:
+                              max_change: float = 30.0, is_sequence_step: bool = False) -> Optional[Dict[str, float]]:
         """Validate and clamp LLM-generated action to safe values.
         
         Args:
             action: Dict of motor positions
             current_positions: Current/expected positions to validate against
-            max_change: Maximum degrees change per motor (default 15°, reduced for motor safety)
+            max_change: Maximum degrees change per motor (default 30°)
             is_sequence_step: If True, allow slightly larger changes since sequence is pre-planned
         """
         if not isinstance(action, dict):
@@ -3237,12 +3260,11 @@ CRITICAL RULES:
         
         safe_action = {}
         
-        # Reduced max change to prevent motor overheating
-        # Allow slightly larger changes in sequences, but still conservative
+        # More permissive movement limits - rely on overload detection for real safety
         if is_sequence_step:
-            max_change = 20.0  # Reduced from 35° to prevent overheating
+            max_change = 40.0  # Larger for planned sequences
         else:
-            max_change = 15.0  # Reduced from 25° for single actions
+            max_change = 30.0  # More permissive for single actions
         
         for motor_name, value in action.items():
             # Remove .pos suffix if present
@@ -3286,43 +3308,65 @@ CRITICAL RULES:
         return safe_action if safe_action else None
     
     def _execute_llm_action(self, action: Dict[str, float]):
-        """Execute validated LLM action on robot with overload/port error detection."""
+        """Execute validated LLM action on robot with COORDINATED multi-motor movement.
+        
+        Uses sync_write to move all motors SIMULTANEOUSLY, avoiding interference
+        when motors need to move together (like elbow needing shoulder to adjust).
+        """
         try:
-            overload_detected = False
-            port_conflict = False
-            
+            # Build dict of motor positions for sync_write
+            motor_positions = {}
             for motor_key, value in action.items():
                 motor_name = motor_key.replace(".pos", "")
                 if motor_name in self.all_motors:
+                    motor_positions[motor_name] = value
+            
+            if not motor_positions:
+                print("   ⚠️ No valid motor positions in action")
+                return
+            
+            # Log what we're about to do
+            print(f"   🔄 Coordinated move: {', '.join([f'{k}={v:.1f}°' for k,v in motor_positions.items()])}")
+            
+            try:
+                # Use sync_write to move ALL motors SIMULTANEOUSLY
+                # This avoids interference issues where one motor blocks another
+                self.bus.sync_write("Goal_Position", motor_positions, normalize=True)
+                print(f"   ✓ sync_write completed for {len(motor_positions)} motors")
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                print(f"   ⚠️ sync_write failed: {e}")
+                
+                # Check for specific errors
+                if "overload" in error_msg:
+                    print("   🔥 OVERLOAD detected!")
+                    print("   ⏸️ Pausing 3 seconds due to overload...")
+                    time.sleep(3.0)
+                    raise RuntimeError("Motor overload detected - action stopped for safety")
+                
+                if "port is in use" in error_msg or ("port" in error_msg and "use" in error_msg):
+                    print("   🔌 PORT CONFLICT detected")
+                    print("   ⏸️ Pausing 1 second...")
+                    time.sleep(1.0)
+                
+                # Fall back to sequential writes if sync_write fails
+                print("   📝 Falling back to sequential writes...")
+                for motor_name, value in motor_positions.items():
                     try:
                         self.bus.write("Goal_Position", motor_name, value, normalize=True)
-                        time.sleep(0.15)  # Increased delay for motor safety
-                    except Exception as e:
-                        error_msg = str(e).lower()
-                        print(f"   ⚠️ Motor {motor_name} write error: {e}")
-                        
-                        if "overload" in error_msg:
-                            overload_detected = True
-                            print(f"   🔥 OVERLOAD detected on {motor_name}")
-                        if "port is in use" in error_msg or ("port" in error_msg and "use" in error_msg):
-                            port_conflict = True
-                            print(f"   🔌 PORT CONFLICT detected")
+                        time.sleep(0.05)  # Minimal delay between motors
+                    except Exception as e2:
+                        print(f"   ⚠️ {motor_name} write error: {e2}")
             
-            # Handle errors
-            if overload_detected:
-                print("   ⏸️ Pausing 3 seconds due to overload...")
-                time.sleep(3.0)  # Cool-down pause
-                raise RuntimeError("Motor overload detected - action stopped for safety")
-            
-            if port_conflict:
-                print("   ⏸️ Pausing 1 second due to port conflict...")
-                time.sleep(1.0)
+            # Wait for motors to reach target
+            time.sleep(0.5)
             
             # Update position model after execution
-            time.sleep(0.5)  # Increased wait for motors to settle
             self.update_position_model()
             
             self.status_bar.setText("✅ LLM action executed")
+            
         except RuntimeError:
             raise  # Re-raise overload errors
         except Exception as e:
@@ -3378,42 +3422,56 @@ CRITICAL RULES:
                     print(f"⚠️ Skipping step {step_num}: validation failed")
                     continue
                 
-                # Execute the step
+                # Execute the step with COORDINATED multi-motor movement
                 try:
                     self.status_bar.setText(f"🔄 Executing step {step_num}/{len(sequence)}: {step_desc}")
                     print(f"   Sending commands: {json.dumps({k: f'{v:.1f}°' for k, v in safe_action.items()})}")
                     
-                    # Track errors for overload/port conflict detection
-                    write_errors = []
-                    overload_detected = False
-                    port_conflict = False
-                    
+                    # Build dict of motor positions for sync_write
+                    motor_positions = {}
                     for motor_key, value in safe_action.items():
                         motor_name = motor_key.replace(".pos", "")
                         if motor_name in self.all_motors:
-                            try:
-                                self.bus.write("Goal_Position", motor_name, value, normalize=True)
-                                time.sleep(0.1)  # Increased delay between motor commands for safety
-                            except Exception as e:
-                                error_msg = str(e).lower()
-                                print(f"   ⚠️ Motor {motor_name} write error: {e}")
-                                write_errors.append((motor_name, error_msg))
-                                
-                                # Detect overload
-                                if "overload" in error_msg:
-                                    overload_detected = True
-                                    print(f"   🔥 OVERLOAD detected on {motor_name} - stopping sequence")
-                                
-                                # Detect port conflict
-                                if "port is in use" in error_msg or "port" in error_msg and "use" in error_msg:
-                                    port_conflict = True
-                                    print(f"   🔌 PORT CONFLICT detected - pausing")
+                            motor_positions[motor_name] = value
+                    
+                    # Track errors for overload/port conflict detection
+                    overload_detected = False
+                    port_conflict = False
+                    
+                    try:
+                        # Use sync_write to move ALL motors SIMULTANEOUSLY
+                        # This avoids interference issues where one motor blocks another
+                        self.bus.sync_write("Goal_Position", motor_positions, normalize=True)
+                        print(f"   ✓ sync_write: {len(motor_positions)} motors moved together")
+                        
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        print(f"   ⚠️ sync_write failed: {e}")
+                        
+                        # Check for specific errors
+                        if "overload" in error_msg:
+                            overload_detected = True
+                            print(f"   🔥 OVERLOAD detected - stopping sequence")
+                        
+                        if "port is in use" in error_msg or ("port" in error_msg and "use" in error_msg):
+                            port_conflict = True
+                            print(f"   🔌 PORT CONFLICT detected - pausing")
+                        
+                        # Fall back to sequential writes if sync_write fails
+                        if not overload_detected and not port_conflict:
+                            print("   📝 Falling back to sequential writes...")
+                            for motor_name, value in motor_positions.items():
+                                try:
+                                    self.bus.write("Goal_Position", motor_name, value, normalize=True)
+                                    time.sleep(0.05)  # Minimal delay
+                                except Exception as e2:
+                                    print(f"   ⚠️ {motor_name} write error: {e2}")
                     
                     # If overload or port conflict, stop sequence and wait
                     if overload_detected:
                         self.status_bar.setText(f"⚠️ Motor overload detected - stopping sequence for safety")
-                        print("   🔥 OVERLOAD detected - stopping sequence and pausing 3 seconds...")
-                        time.sleep(3.0)  # Cool-down pause
+                        print("   🔥 OVERLOAD detected - stopping sequence and pausing 5 seconds...")
+                        time.sleep(5.0)  # Critical - longer cool-down for motor safety
                         # Don't continue sequence - return False to stop
                         return False
                     
@@ -3553,7 +3611,7 @@ Output JSON:
     {{
       "action": {{"shoulder_pan.pos": <float>, "shoulder_lift.pos": <float>, ...}},
       "description": "<what this corrective step does>",
-      "wait_after": 0.5
+      "wait_after": 0.3
     }}
   ]
 }}
@@ -3867,24 +3925,8 @@ Guidelines:
             return None
     
     def update_main_camera(self, pixmap):
-        """Update main camera view from monitoring thread."""
-        self.main_camera_label.setPixmap(pixmap)
-        self.main_camera_status.setText("[LIVE]")
-        self.main_camera_status.setStyleSheet("color: #3fb950;")
-        
-        # Update FPS for main camera
-        if not hasattr(self, '_main_frame_count'):
-            self._main_frame_count = 0
-            self._main_last_fps_time = time.time()
-        self._main_frame_count += 1
-        current_time = time.time()
-        if current_time - self._main_last_fps_time >= 1.0:
-            main_fps = self._main_frame_count / (current_time - self._main_last_fps_time)
-            self._main_fps = main_fps
-            gripper_fps = getattr(self, '_gripper_fps', 0)
-            self.fps_label.setText(f"FPS: Main: {main_fps:.1f} | Gripper: {gripper_fps:.1f}")
-            self._main_frame_count = 0
-            self._main_last_fps_time = current_time
+        """Unused - kept for compatibility."""
+        pass
     
     def update_gripper_camera(self, pixmap):
         """Update gripper camera view from monitoring thread."""
@@ -3892,17 +3934,15 @@ Guidelines:
         self.gripper_camera_status.setText("[LIVE]")
         self.gripper_camera_status.setStyleSheet("color: #3fb950;")
         
-        # Update FPS for gripper camera
+        # Update FPS counter
         if not hasattr(self, '_gripper_frame_count'):
             self._gripper_frame_count = 0
             self._gripper_last_fps_time = time.time()
         self._gripper_frame_count += 1
         current_time = time.time()
         if current_time - self._gripper_last_fps_time >= 1.0:
-            gripper_fps = self._gripper_frame_count / (current_time - self._gripper_last_fps_time)
-            self._gripper_fps = gripper_fps
-            main_fps = getattr(self, '_main_fps', 0)
-            self.fps_label.setText(f"FPS: Main: {main_fps:.1f} | Gripper: {gripper_fps:.1f}")
+            fps = self._gripper_frame_count / (current_time - self._gripper_last_fps_time)
+            self.fps_label.setText(f"FPS: {fps:.1f}")
             self._gripper_frame_count = 0
             self._gripper_last_fps_time = current_time
     
@@ -4098,7 +4138,7 @@ Guidelines:
             self.status_bar.setText(f"❌ Home move failed: {e}")
     
     def test_motors(self):
-        """Test each motor individually by moving it a small amount."""
+        """Test motors with coordinated movements to avoid interference."""
         if not hasattr(self, 'bus') or not self.bus.is_connected:
             self.status_bar.setText("❌ Robot not connected")
             return
@@ -4109,150 +4149,146 @@ Guidelines:
                 self.monitor_thread.paused = True
                 time.sleep(0.2)
             
-            print("🧪 Testing all motors with small movements...")
+            print("🧪 Testing motors with COORDINATED movements...")
+            print("   ℹ️ Moving multiple motors together to avoid interference")
             self.status_bar.setText("🧪 Testing motors...")
             
-            # Movement amounts (in degrees for joints, percentage for gripper)
-            test_movements = {
-                "shoulder_pan": 5.0,      # 5 degrees
-                "shoulder_lift": 5.0,     # 5 degrees
-                "elbow_flex": 5.0,        # 5 degrees
-                "wrist_flex": 5.0,         # 5 degrees
-                "wrist_roll": 10.0,       # 10 degrees (more rotation range)
-                "gripper": 5.0             # 5% (small gripper movement)
+            # Coordinated movement amounts per step (small increments)
+            # Moving all motors together avoids interference from arm structure
+            step_movements = {
+                "shoulder_pan": 1.0,       # 1 degree per step
+                "shoulder_lift": 1.0,      # 1 degree per step  
+                "elbow_flex": 1.0,         # 1 degree per step
+                "wrist_flex": 1.0,         # 1 degree per step
+                "wrist_roll": 2.0,         # 2 degrees per step (more rotation range)
+                "gripper": 1.0             # 1% per step
             }
             
+            num_steps = 5  # Total steps in each direction
+            step_delay = 0.3  # Delay between steps (seconds)
+            
             # Read current positions (normalized)
-            current_positions = {}
+            print("\n📊 Reading current positions...")
+            start_positions = {}
             for motor_name in self.all_motors.keys():
                 try:
                     pos = self.bus.read("Present_Position", motor_name, normalize=True)
-                    current_positions[motor_name] = pos
-                    print(f"  {motor_name}: current = {pos:.1f}°")
+                    start_positions[motor_name] = pos
+                    unit = "%" if motor_name == "gripper" else "°"
+                    print(f"  {motor_name}: {pos:.1f}{unit}")
                 except Exception as e:
                     print(f"  ⚠️ Could not read {motor_name}: {e}")
-                    current_positions[motor_name] = None
+                    start_positions[motor_name] = None
             
-            # Test each motor
-            for motor_name in self.all_motors.keys():
-                if motor_name not in current_positions or current_positions[motor_name] is None:
-                    print(f"  ⏭️ Skipping {motor_name} (no current position - motor may not be connected)")
-                    continue
-                
-                if motor_name not in test_movements:
-                    print(f"  ⏭️ Skipping {motor_name} (no test movement defined)")
-                    continue
-                
-                movement = test_movements[motor_name]
-                current_pos = current_positions[motor_name]
-                
-                # For elbow_flex specifically, use special handling due to issues
-                # NOTE: Motor 3 is typically at its minimum position and can only move in POSITIVE direction!
-                if motor_name == "elbow_flex":
-                    print(f"\n  🔧 SPECIAL HANDLING for elbow_flex (motor 3)...")
-                    print(f"     ℹ️ Motor 3 is at minimum - can only move in POSITIVE direction")
-                    
-                    try:
-                        # Get comprehensive motor status
-                        raw_pos = self.bus.read("Present_Position", motor_name, normalize=False)
-                        norm_pos = self.bus.read("Present_Position", motor_name, normalize=True)
-                        torque_enabled = self.bus.read("Torque_Enable", motor_name)
-                        
-                        print(f"     📊 Motor 3 Status:")
-                        print(f"        Normalized Position: {norm_pos:.1f}°")
-                        print(f"        Raw Position: {raw_pos}")
-                        print(f"        Torque Enabled: {torque_enabled}")
-                        
-                        # Enable torque first if not enabled
-                        if torque_enabled != 1:
-                            print(f"        ⚠️ Torque not enabled! Enabling...")
-                            self.bus.write("Torque_Enable", motor_name, 1)
-                            time.sleep(0.2)
-                        
-                        # Try POSITIVE direction (motor 3 is at minimum, can only go positive!)
-                        movement = 5.0  # Move 5 degrees in positive direction
-                        target_norm = norm_pos + movement
-                        
-                        print(f"\n     🔧 Attempting POSITIVE direction movement...")
-                        print(f"        Current: {norm_pos:.1f}° → Target: {target_norm:.1f}° (Δ=+{movement}°)")
-                        
-                        # Write goal position using normalized values
-                        self.bus.write("Goal_Position", motor_name, target_norm, normalize=True)
-                        print(f"        ✓ Wrote Goal_Position = {target_norm:.1f}° (normalized)")
-                        
-                        time.sleep(2.0)  # Wait for movement
-                        
-                        # Read new position
-                        new_norm_pos = self.bus.read("Present_Position", motor_name, normalize=True)
-                        delta = new_norm_pos - norm_pos
-                        print(f"        New position: {new_norm_pos:.1f}°")
-                        print(f"        Movement: {delta:.1f}°")
-                        
-                        if abs(delta) < 1.0:
-                            print(f"     ⚠️ Motor 3 barely moved!")
-                            print(f"        Motor may be stuck or have an issue")
-                        else:
-                            print(f"     ✅ Motor 3 moved successfully ({delta:.1f}°)")
-                        
-                        # Return to original position
-                        print(f"     ↻ Returning to original position ({norm_pos:.1f}°)...")
-                        self.bus.write("Goal_Position", motor_name, norm_pos, normalize=True)
-                        time.sleep(1.5)
-                        
-                        print(f"     ✅ elbow_flex test complete")
-                        continue  # Skip the normal test flow for this motor
-                        
-                    except Exception as e:
-                        print(f"     ❌ Error during motor 3 special handling: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        continue
-                
-                target_pos = current_pos + movement
-                
-                print(f"\n  🔄 Testing {motor_name}:")
-                print(f"     Current: {current_pos:.1f}° → Target: {target_pos:.1f}° (Δ={movement:.1f}°)")
-                self.status_bar.setText(f"🧪 Testing {motor_name}...")
-                
-                try:
-                    # Move to target
-                    self.bus.write("Goal_Position", motor_name, target_pos, normalize=True)
-                    time.sleep(1.5)  # Wait for movement
-                    
-                    # Read actual position after movement
-                    try:
-                        actual_pos = self.bus.read("Present_Position", motor_name, normalize=True)
-                        actual_movement = actual_pos - current_pos
-                        print(f"     ✅ Moved to {actual_pos:.1f}° (actual Δ={actual_movement:.1f}°)")
-                        
-                        # Check if movement was successful
-                        if abs(actual_movement) < 0.5:
-                            print(f"     ⚠️ Motor barely moved - may be stuck or overloaded")
-                            self.status_bar.setText(f"⚠️ {motor_name} barely moved")
-                        else:
-                            self.status_bar.setText(f"✅ {motor_name} moved successfully")
-                    except Exception as e:
-                        print(f"     ⚠️ Could not verify position: {e}")
-                    
-                    # Return to original position
-                    print(f"     ↻ Returning to original position...")
-                    self.bus.write("Goal_Position", motor_name, current_pos, normalize=True)
-                    time.sleep(1.5)  # Wait for return
-                    
-                    print(f"     ✅ {motor_name} test complete")
-                    
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    print(f"     ❌ Error testing {motor_name}: {e}")
-                    if "overload" in error_msg:
-                        print(f"     🔥 OVERLOAD detected on {motor_name}")
-                        self.status_bar.setText(f"🔥 {motor_name} overload detected")
-                    else:
-                        self.status_bar.setText(f"❌ {motor_name} test failed: {e}")
-                
-                time.sleep(0.5)  # Small pause between motors
+            # Filter to only motors we can read
+            working_motors = [m for m in self.all_motors.keys() if start_positions.get(m) is not None]
+            print(f"\n✅ Working motors: {len(working_motors)}/{len(self.all_motors)}")
             
-            print("\n✅ Motor testing complete")
+            # === PHASE 1: Move all motors together in positive direction ===
+            print(f"\n🔄 PHASE 1: Moving all motors together (+{num_steps} steps)...")
+            self.status_bar.setText("🧪 Phase 1: Coordinated positive movement...")
+            
+            current_positions = start_positions.copy()
+            
+            for step in range(num_steps):
+                print(f"   Step {step + 1}/{num_steps}...", end=" ")
+                
+                # Calculate targets for this step
+                targets = {}
+                for motor_name in working_motors:
+                    if motor_name in step_movements and current_positions[motor_name] is not None:
+                        delta = step_movements[motor_name]
+                        targets[motor_name] = current_positions[motor_name] + delta
+                
+                # Move all motors together
+                for motor_name, target in targets.items():
+                    try:
+                        self.bus.write("Goal_Position", motor_name, target, normalize=True)
+                    except Exception as e:
+                        print(f"\n      ⚠️ {motor_name}: {e}")
+                
+                time.sleep(step_delay)
+                
+                # Read new positions
+                for motor_name in working_motors:
+                    try:
+                        current_positions[motor_name] = self.bus.read("Present_Position", motor_name, normalize=True)
+                    except:
+                        pass
+                
+                print("✓")
+            
+            # Show movement summary
+            print("\n   📊 Movement summary (Phase 1):")
+            for motor_name in working_motors:
+                start = start_positions[motor_name]
+                current = current_positions[motor_name]
+                if start is not None and current is not None:
+                    delta = current - start
+                    unit = "%" if motor_name == "gripper" else "°"
+                    status = "✅" if abs(delta) > 0.5 else "⚠️"
+                    print(f"      {status} {motor_name}: {start:.1f} → {current:.1f} (Δ={delta:+.1f}{unit})")
+            
+            time.sleep(0.5)
+            
+            # === PHASE 2: Return all motors to start position ===
+            print(f"\n🔄 PHASE 2: Returning all motors to start positions...")
+            self.status_bar.setText("🧪 Phase 2: Returning to start...")
+            
+            for step in range(num_steps):
+                print(f"   Step {step + 1}/{num_steps}...", end=" ")
+                
+                # Calculate targets for this step (moving back toward start)
+                targets = {}
+                for motor_name in working_motors:
+                    if motor_name in step_movements and current_positions[motor_name] is not None:
+                        # Calculate step toward start position
+                        start = start_positions[motor_name]
+                        current = current_positions[motor_name]
+                        remaining = start - current
+                        steps_left = num_steps - step
+                        if steps_left > 0:
+                            step_size = remaining / steps_left
+                            targets[motor_name] = current + step_size
+                
+                # Move all motors together
+                for motor_name, target in targets.items():
+                    try:
+                        self.bus.write("Goal_Position", motor_name, target, normalize=True)
+                    except Exception as e:
+                        print(f"\n      ⚠️ {motor_name}: {e}")
+                
+                time.sleep(step_delay)
+                
+                # Read new positions
+                for motor_name in working_motors:
+                    try:
+                        current_positions[motor_name] = self.bus.read("Present_Position", motor_name, normalize=True)
+                    except:
+                        pass
+                
+                print("✓")
+            
+            # Final position check
+            print("\n   📊 Final positions:")
+            all_returned = True
+            for motor_name in working_motors:
+                start = start_positions[motor_name]
+                current = current_positions[motor_name]
+                if start is not None and current is not None:
+                    diff = abs(current - start)
+                    unit = "%" if motor_name == "gripper" else "°"
+                    status = "✅" if diff < 2.0 else "⚠️"
+                    if diff >= 2.0:
+                        all_returned = False
+                    print(f"      {status} {motor_name}: {current:.1f}{unit} (diff from start: {diff:.1f}{unit})")
+            
+            if all_returned:
+                print("\n✅ All motors returned to start positions")
+            else:
+                print("\n⚠️ Some motors didn't fully return - may need manual adjustment")
+            
+            print("\n✅ Coordinated motor testing complete")
             self.status_bar.setText("✅ Motor testing complete")
             
         except Exception as e:
@@ -4277,6 +4313,24 @@ Guidelines:
         
         try:
             dialog = ManualMotorControlDialog(self.bus, self.all_motors, self)
+            dialog.exec()
+        finally:
+            # Resume monitoring after dialog closes
+            if hasattr(self, 'monitor_thread') and self.monitor_thread:
+                self.monitor_thread.paused = False
+    
+    def open_position_calibration(self):
+        """Open the position calibration dialog for saving/recalling arm positions."""
+        if not hasattr(self, 'bus') or not self.bus.is_connected:
+            self.status_bar.setText("❌ Robot not connected")
+            return
+        
+        # Pause monitoring during calibration
+        if hasattr(self, 'monitor_thread') and self.monitor_thread:
+            self.monitor_thread.paused = True
+        
+        try:
+            dialog = PositionCalibrationDialog(self.bus, self.all_motors, self)
             dialog.exec()
         finally:
             # Resume monitoring after dialog closes
@@ -5078,6 +5132,602 @@ class ManualMotorControlDialog(QDialog):
         """Clean up when dialog closes."""
         if hasattr(self, 'update_timer'):
             self.update_timer.stop()
+        super().closeEvent(event)
+
+
+class PositionCalibrationDialog(QDialog):
+    """Dialog for saving and recalling arm positions."""
+    
+    POSITIONS_FILE = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower/saved_positions.json"
+    
+    # Default preset positions for chess robot
+    DEFAULT_POSITIONS = {
+        "home": {
+            "description": "Safe home position",
+            "positions": {
+                "shoulder_pan": 0.0,
+                "shoulder_lift": 0.0,
+                "elbow_flex": 0.0,
+                "wrist_flex": 0.0,
+                "wrist_roll": 0.0,
+                "gripper": 50.0
+            }
+        },
+        "overview": {
+            "description": "Overview position to see chess board",
+            "positions": {
+                "shoulder_pan": 0.0,
+                "shoulder_lift": 40.0,
+                "elbow_flex": 40.0,
+                "wrist_flex": -30.0,
+                "wrist_roll": 0.0,
+                "gripper": 50.0
+            }
+        },
+        "ready": {
+            "description": "Ready position above board center",
+            "positions": {
+                "shoulder_pan": 0.0,
+                "shoulder_lift": -20.0,
+                "elbow_flex": -20.0,
+                "wrist_flex": 0.0,
+                "wrist_roll": 0.0,
+                "gripper": 30.0
+            }
+        }
+    }
+    
+    def __init__(self, bus, motors, parent=None):
+        super().__init__(parent)
+        self.bus = bus
+        self.motors = motors
+        self.parent_window = parent
+        self.setWindowTitle("Position Calibration")
+        self.setMinimumSize(900, 700)
+        self.setStyleSheet("""
+            QDialog {
+                background: #0d1117;
+                color: #c9d1d9;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                margin-top: 12px;
+                padding-top: 10px;
+                background: #161b22;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+            QLabel {
+                color: #c9d1d9;
+            }
+            QPushButton {
+                background: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #30363d;
+                border-color: #8b949e;
+            }
+            QPushButton:pressed {
+                background: #0d1117;
+            }
+            QLineEdit {
+                background: #0d1117;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+                padding: 8px;
+            }
+            QListWidget {
+                background: #0d1117;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+            }
+            QListWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #21262d;
+            }
+            QListWidget::item:selected {
+                background: #238636;
+            }
+            QListWidget::item:hover {
+                background: #30363d;
+            }
+        """)
+        
+        self.saved_positions = self.load_positions()
+        self.setup_ui()
+        self.start_position_updates()
+    
+    def load_positions(self) -> dict:
+        """Load saved positions from file."""
+        if self.POSITIONS_FILE.exists():
+            try:
+                with open(self.POSITIONS_FILE) as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"⚠️ Error loading positions: {e}")
+        
+        # Return default positions if file doesn't exist
+        return self.DEFAULT_POSITIONS.copy()
+    
+    def save_positions_to_file(self):
+        """Save positions to file."""
+        try:
+            self.POSITIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.POSITIONS_FILE, 'w') as f:
+                json.dump(self.saved_positions, f, indent=2)
+            print(f"✅ Positions saved to {self.POSITIONS_FILE}")
+        except Exception as e:
+            print(f"❌ Error saving positions: {e}")
+    
+    def setup_ui(self):
+        """Create the position calibration UI."""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Title
+        title = QLabel("📍 Position Calibration")
+        title.setStyleSheet("font-size: 18pt; font-weight: bold; color: #238636;")
+        layout.addWidget(title)
+        
+        # Instructions
+        instructions = QLabel(
+            "Save arm positions for quick recall. Disable torque to manually position the arm, "
+            "then save. Use 'GO TO' to move to a saved position."
+        )
+        instructions.setStyleSheet("color: #8b949e; font-size: 10pt;")
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        
+        # Main content - two columns
+        content_layout = QHBoxLayout()
+        
+        # LEFT: Current position and save controls
+        left_group = QGroupBox("Current Position")
+        left_layout = QVBoxLayout(left_group)
+        
+        # Current position display
+        self.position_labels = {}
+        pos_grid = QGridLayout()
+        pos_grid.setSpacing(8)
+        
+        row = 0
+        for motor_name in self.motors.keys():
+            name_label = QLabel(f"{motor_name}:")
+            name_label.setStyleSheet("font-weight: bold;")
+            pos_grid.addWidget(name_label, row, 0)
+            
+            value_label = QLabel("--")
+            value_label.setStyleSheet("color: #58a6ff; font-size: 12pt;")
+            pos_grid.addWidget(value_label, row, 1)
+            
+            unit_label = QLabel("%" if motor_name == "gripper" else "°")
+            pos_grid.addWidget(unit_label, row, 2)
+            
+            self.position_labels[motor_name] = value_label
+            row += 1
+        
+        left_layout.addLayout(pos_grid)
+        
+        # Torque control
+        left_layout.addSpacing(10)
+        self.torque_btn = QPushButton("🔌 DISABLE TORQUE (Manual Position)")
+        self.torque_btn.clicked.connect(self.toggle_torque)
+        self.torque_btn.setStyleSheet("""
+            QPushButton {
+                background: #da3633;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #f85149;
+            }
+        """)
+        left_layout.addWidget(self.torque_btn)
+        
+        # Save section
+        left_layout.addSpacing(20)
+        save_label = QLabel("Save Current Position:")
+        save_label.setStyleSheet("font-weight: bold; color: #238636;")
+        left_layout.addWidget(save_label)
+        
+        name_layout = QHBoxLayout()
+        name_layout.addWidget(QLabel("Name:"))
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("e.g., board_center, pick_e4")
+        name_layout.addWidget(self.name_input)
+        left_layout.addLayout(name_layout)
+        
+        desc_layout = QHBoxLayout()
+        desc_layout.addWidget(QLabel("Description:"))
+        self.desc_input = QLineEdit()
+        self.desc_input.setPlaceholderText("Optional description")
+        desc_layout.addWidget(self.desc_input)
+        left_layout.addLayout(desc_layout)
+        
+        self.save_btn = QPushButton("💾 SAVE POSITION")
+        self.save_btn.clicked.connect(self.save_current_position)
+        self.save_btn.setStyleSheet("""
+            QPushButton {
+                background: #238636;
+                color: white;
+                font-size: 12pt;
+                padding: 12px;
+            }
+            QPushButton:hover {
+                background: #2ea043;
+            }
+        """)
+        left_layout.addWidget(self.save_btn)
+        
+        left_layout.addStretch()
+        content_layout.addWidget(left_group, 1)
+        
+        # RIGHT: Saved positions list
+        right_group = QGroupBox("Saved Positions")
+        right_layout = QVBoxLayout(right_group)
+        
+        # Position list
+        self.position_list = QListWidget()
+        self.position_list.itemClicked.connect(self.on_position_selected)
+        self.position_list.itemDoubleClicked.connect(self.go_to_selected)
+        self.refresh_position_list()
+        right_layout.addWidget(self.position_list, 1)
+        
+        # Selected position info
+        self.selected_info = QLabel("Select a position to see details")
+        self.selected_info.setStyleSheet("color: #8b949e; font-size: 9pt;")
+        self.selected_info.setWordWrap(True)
+        right_layout.addWidget(self.selected_info)
+        
+        # Action buttons
+        btn_layout = QHBoxLayout()
+        
+        self.goto_btn = QPushButton("🎯 GO TO")
+        self.goto_btn.clicked.connect(self.go_to_selected)
+        self.goto_btn.setStyleSheet("""
+            QPushButton {
+                background: #1f6feb;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #388bfd;
+            }
+        """)
+        btn_layout.addWidget(self.goto_btn)
+        
+        self.update_btn = QPushButton("🔄 UPDATE")
+        self.update_btn.setToolTip("Update selected position with current arm position")
+        self.update_btn.clicked.connect(self.update_selected_position)
+        self.update_btn.setStyleSheet("""
+            QPushButton {
+                background: #f0883e;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #ff9a4d;
+            }
+        """)
+        btn_layout.addWidget(self.update_btn)
+        
+        self.delete_btn = QPushButton("🗑️ DELETE")
+        self.delete_btn.clicked.connect(self.delete_selected)
+        self.delete_btn.setStyleSheet("""
+            QPushButton {
+                background: #da3633;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #f85149;
+            }
+        """)
+        btn_layout.addWidget(self.delete_btn)
+        
+        right_layout.addLayout(btn_layout)
+        
+        # Quick preset buttons
+        right_layout.addSpacing(10)
+        preset_label = QLabel("Quick Presets:")
+        preset_label.setStyleSheet("font-weight: bold;")
+        right_layout.addWidget(preset_label)
+        
+        preset_layout = QHBoxLayout()
+        for preset_name in ["home", "overview", "ready"]:
+            if preset_name in self.saved_positions:
+                btn = QPushButton(preset_name.title())
+                btn.clicked.connect(lambda checked, n=preset_name: self.go_to_position(n))
+                preset_layout.addWidget(btn)
+        preset_layout.addStretch()
+        right_layout.addLayout(preset_layout)
+        
+        content_layout.addWidget(right_group, 1)
+        layout.addLayout(content_layout, 1)
+        
+        # Bottom buttons
+        bottom_layout = QHBoxLayout()
+        
+        refresh_btn = QPushButton("🔄 REFRESH")
+        refresh_btn.clicked.connect(self.refresh_position_list)
+        bottom_layout.addWidget(refresh_btn)
+        
+        bottom_layout.addStretch()
+        
+        close_btn = QPushButton("✖ CLOSE")
+        close_btn.clicked.connect(self.accept)
+        bottom_layout.addWidget(close_btn)
+        
+        layout.addLayout(bottom_layout)
+    
+    def start_position_updates(self):
+        """Start timer to update position displays."""
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.update_positions)
+        self.update_timer.start(200)
+        self.update_positions()
+    
+    def update_positions(self):
+        """Update current position display."""
+        for motor_name, label in self.position_labels.items():
+            try:
+                pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                label.setText(f"{pos:.1f}")
+            except:
+                label.setText("ERR")
+    
+    def toggle_torque(self):
+        """Toggle torque on/off for manual positioning."""
+        try:
+            # Check current state
+            any_enabled = False
+            for motor_name in self.motors.keys():
+                try:
+                    if self.bus.read("Torque_Enable", motor_name) == 1:
+                        any_enabled = True
+                        break
+                except:
+                    pass
+            
+            # Toggle
+            new_state = 0 if any_enabled else 1
+            for motor_name in self.motors.keys():
+                try:
+                    self.bus.write("Torque_Enable", motor_name, new_state)
+                except:
+                    pass
+            
+            # Update button
+            if new_state == 0:
+                self.torque_btn.setText("🔌 ENABLE TORQUE")
+                self.torque_btn.setStyleSheet("""
+                    QPushButton {
+                        background: #238636;
+                        color: white;
+                    }
+                    QPushButton:hover {
+                        background: #2ea043;
+                    }
+                """)
+                print("⚡ Torque DISABLED - you can manually position the arm")
+            else:
+                self.torque_btn.setText("🔌 DISABLE TORQUE (Manual Position)")
+                self.torque_btn.setStyleSheet("""
+                    QPushButton {
+                        background: #da3633;
+                        color: white;
+                    }
+                    QPushButton:hover {
+                        background: #f85149;
+                    }
+                """)
+                print("⚡ Torque ENABLED - motors active")
+        except Exception as e:
+            print(f"❌ Error toggling torque: {e}")
+    
+    def save_current_position(self):
+        """Save the current arm position."""
+        name = self.name_input.text().strip()
+        if not name:
+            print("⚠️ Please enter a position name")
+            return
+        
+        # Sanitize name
+        name = name.lower().replace(" ", "_")
+        
+        # Check if position already exists and ask for confirmation
+        if name in self.saved_positions:
+            reply = QMessageBox.question(
+                self,
+                "Overwrite Position?",
+                f"Position '{name}' already exists.\n\nDo you want to overwrite it with the current arm position?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                print(f"⚠️ Overwrite cancelled for '{name}'")
+                return
+        
+        # Read current positions
+        positions = {}
+        for motor_name in self.motors.keys():
+            try:
+                pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                positions[motor_name] = round(pos, 1)
+            except Exception as e:
+                print(f"⚠️ Could not read {motor_name}: {e}")
+                return
+        
+        # Save (will overwrite if exists)
+        is_update = name in self.saved_positions
+        self.saved_positions[name] = {
+            "description": self.desc_input.text().strip() or f"Saved position: {name}",
+            "positions": positions
+        }
+        
+        self.save_positions_to_file()
+        self.refresh_position_list()
+        
+        # Clear inputs
+        self.name_input.clear()
+        self.desc_input.clear()
+        
+        if is_update:
+            print(f"✅ Position '{name}' updated")
+        else:
+            print(f"✅ Position '{name}' saved")
+    
+    def refresh_position_list(self):
+        """Refresh the list of saved positions."""
+        self.position_list.clear()
+        for name, data in self.saved_positions.items():
+            desc = data.get("description", "")
+            self.position_list.addItem(f"📍 {name}: {desc[:40]}...")
+    
+    def on_position_selected(self, item):
+        """Show details of selected position."""
+        text = item.text()
+        name = text.split(":")[0].replace("📍 ", "").strip()
+        
+        if name in self.saved_positions:
+            data = self.saved_positions[name]
+            info = f"Position: {name}\n"
+            info += f"Description: {data.get('description', 'N/A')}\n\n"
+            info += "Joint positions:\n"
+            for motor, pos in data.get("positions", {}).items():
+                unit = "%" if motor == "gripper" else "°"
+                info += f"  {motor}: {pos}{unit}\n"
+            self.selected_info.setText(info)
+    
+    def go_to_selected(self):
+        """Go to the selected position."""
+        item = self.position_list.currentItem()
+        if not item:
+            return
+        
+        text = item.text()
+        name = text.split(":")[0].replace("📍 ", "").strip()
+        self.go_to_position(name)
+    
+    def go_to_position(self, name: str):
+        """Move arm to a saved position using coordinated movement."""
+        if name not in self.saved_positions:
+            print(f"⚠️ Position '{name}' not found")
+            return
+        
+        data = self.saved_positions[name]
+        positions = data.get("positions", {})
+        
+        print(f"🎯 Moving to position '{name}'...")
+        
+        try:
+            # Use sync_write for coordinated movement
+            self.bus.sync_write("Goal_Position", positions, normalize=True)
+            print(f"✅ Moved to '{name}'")
+        except Exception as e:
+            print(f"⚠️ sync_write failed: {e}, trying sequential...")
+            # Fall back to sequential
+            for motor_name, target in positions.items():
+                try:
+                    self.bus.write("Goal_Position", motor_name, target, normalize=True)
+                    time.sleep(0.1)
+                except Exception as e2:
+                    print(f"⚠️ {motor_name}: {e2}")
+    
+    def update_selected_position(self):
+        """Update the selected position with current arm position."""
+        item = self.position_list.currentItem()
+        if not item:
+            print("⚠️ Please select a position to update")
+            return
+        
+        text = item.text()
+        name = text.split(":")[0].replace("📍 ", "").strip()
+        
+        if name not in self.saved_positions:
+            print(f"⚠️ Position '{name}' not found")
+            return
+        
+        # Ask for confirmation
+        reply = QMessageBox.question(
+            self,
+            "Update Position?",
+            f"Update position '{name}' with the current arm position?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Read current positions
+        positions = {}
+        for motor_name in self.motors.keys():
+            try:
+                pos = self.bus.read("Present_Position", motor_name, normalize=True)
+                positions[motor_name] = round(pos, 1)
+            except Exception as e:
+                print(f"⚠️ Could not read {motor_name}: {e}")
+                return
+        
+        # Update the position (keep the existing description if not changed)
+        old_desc = self.saved_positions[name].get("description", "")
+        self.saved_positions[name] = {
+            "description": old_desc,
+            "positions": positions
+        }
+        
+        self.save_positions_to_file()
+        self.refresh_position_list()
+        self.on_position_selected(item)  # Update the info display
+        
+        print(f"✅ Position '{name}' updated with current arm position")
+    
+    def delete_selected(self):
+        """Delete the selected position."""
+        item = self.position_list.currentItem()
+        if not item:
+            return
+        
+        text = item.text()
+        name = text.split(":")[0].replace("📍 ", "").strip()
+        
+        if name in self.saved_positions:
+            # Ask for confirmation
+            reply = QMessageBox.question(
+                self,
+                "Delete Position?",
+                f"Are you sure you want to delete position '{name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+            
+            del self.saved_positions[name]
+            self.save_positions_to_file()
+            self.refresh_position_list()
+            self.selected_info.setText("Position deleted")
+            print(f"🗑️ Position '{name}' deleted")
+    
+    def closeEvent(self, event):
+        """Clean up when dialog closes."""
+        if hasattr(self, 'update_timer'):
+            self.update_timer.stop()
+        # Re-enable torque before closing
+        for motor_name in self.motors.keys():
+            try:
+                self.bus.write("Torque_Enable", motor_name, 1)
+            except:
+                pass
         super().closeEvent(event)
 
 
