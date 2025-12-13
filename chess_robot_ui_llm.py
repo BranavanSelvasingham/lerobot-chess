@@ -17,6 +17,8 @@ import cv2
 import json
 import time
 import numpy as np
+from collections import deque
+from datetime import datetime
 from pathlib import Path
 from PIL import Image
 import base64
@@ -67,7 +69,7 @@ except ImportError:
 # Robot imports
 from lerobot.motors.feetech.feetech import FeetechMotorsBus, OperatingMode
 from lerobot.motors.motors_bus import Motor, MotorNormMode, MotorCalibration
-from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig, ColorMode
 from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
 from lerobot.model.kinematics import RobotKinematics
 
@@ -815,7 +817,12 @@ class MonitoringThread(QThread):
 
 
 class ChessRobotUILLM(QMainWindow):
-    def __init__(self, port: str, dev_mode: bool = False, api_key: Optional[str] = None, workflow_id: Optional[str] = None):
+    # Thread-safe UI update signals (queued to the main Qt thread)
+    exec_log_line_signal = Signal(str)
+    exec_log_reset_signal = Signal()
+    execution_ui_mode_signal = Signal(bool)
+
+    def __init__(self, port: Optional[str] = None, dev_mode: bool = False, api_key: Optional[str] = None, workflow_id: Optional[str] = None):
         super().__init__()
         self.port = port
         self.running = False
@@ -838,6 +845,22 @@ class ChessRobotUILLM(QMainWindow):
             "last_update": None  # Timestamp of last update
         }
         self.update_position_model()  # Initialize with current positions
+
+        # Execution log (ring buffer) - used for UI visibility + LLM context during loops
+        self._exec_log_lines = deque(maxlen=400)  # pre-formatted lines
+        self._exec_log_prompt_max_lines = 30
+        self._execution_active = False
+        self._exec_log_display_max_lines = 250
+        
+        # Workspace estimate (computed from calibration + FK sampling)
+        self.workspace_estimate = self._load_workspace_estimate()
+        if not self.workspace_estimate:
+            # Safe: computation only (no motor movement)
+            self.workspace_estimate = self._estimate_workspace_from_calibration(sample_count=1200)
+            self._save_workspace_estimate(self.workspace_estimate)
+
+        # Vision+motor localization hints for "where the board is in view"
+        self.board_view_calibration = self._load_board_view_calibration() or {}
         
         # Create main window - adaptive sizing
         self.setWindowTitle("Chess Robot Monitor - LLM Control Interface")
@@ -1001,9 +1024,195 @@ class ChessRobotUILLM(QMainWindow):
         
         # Start monitoring
         self.start_monitoring()
+
+    def _workspace_estimate_path(self) -> Path:
+        calib_dir = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower"
+        calib_dir.mkdir(parents=True, exist_ok=True)
+        return calib_dir / "workspace_estimate.json"
+
+    def _board_view_calibration_path(self) -> Path:
+        calib_dir = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower"
+        calib_dir.mkdir(parents=True, exist_ok=True)
+        return calib_dir / "board_view_calibration.json"
+
+    def _load_board_view_calibration(self) -> Optional[Dict[str, Any]]:
+        try:
+            p = self._board_view_calibration_path()
+            if p.exists():
+                with open(p) as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return None
+
+    def _save_board_view_calibration(self, calib: Optional[Dict[str, Any]]):
+        try:
+            if not calib:
+                return
+            p = self._board_view_calibration_path()
+            with open(p, "w") as f:
+                json.dump(calib, f, indent=2)
+        except Exception:
+            pass
+
+    # NOTE: We intentionally do NOT use OpenCV chessboard detectors for localization.
+    # Detection and reasoning are performed via LLM vision to be robust to non-standard boards,
+    # lighting, and partial views.
+
+    def _load_workspace_estimate(self) -> Optional[Dict[str, Any]]:
+        try:
+            p = self._workspace_estimate_path()
+            if p.exists():
+                with open(p) as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return None
+
+    def _save_workspace_estimate(self, estimate: Optional[Dict[str, Any]]):
+        try:
+            if not estimate:
+                return
+            p = self._workspace_estimate_path()
+            with open(p, "w") as f:
+                json.dump(estimate, f, indent=2)
+        except Exception:
+            pass
+
+    def _joint_limits_deg_from_calibration(self) -> Dict[str, Dict[str, float]]:
+        """Derive per-joint min/max in degrees from motor calibration range_min/max.
+
+        In lerobot's DEGREES mode, degrees are computed as: (raw - mid) * 360 / (resolution-1),
+        where mid = (range_min + range_max)/2. So min/max degrees come directly from raw min/max.
+        """
+        limits: Dict[str, Dict[str, float]] = {}
+        try:
+            if not getattr(self, "bus", None) or not getattr(self.bus, "calibration", None):
+                return limits
+            for motor_name, cal in self.bus.calibration.items():
+                if motor_name not in self.all_motors:
+                    continue
+                if self.all_motors[motor_name].norm_mode is not MotorNormMode.DEGREES:
+                    continue
+                min_raw = float(cal.range_min)
+                max_raw = float(cal.range_max)
+                mid = (min_raw + max_raw) / 2.0
+                max_res = float(self.bus.model_resolution_table[self.all_motors[motor_name].model] - 1)
+                min_deg = (min_raw - mid) * 360.0 / max_res
+                max_deg = (max_raw - mid) * 360.0 / max_res
+                lo = float(min(min_deg, max_deg))
+                hi = float(max(min_deg, max_deg))
+                limits[motor_name] = {"min": lo, "max": hi}
+        except Exception as e:
+            self._append_exec_log("warning", f"Workspace: failed to derive joint limits from calibration: {e}")
+        return limits
+
+    def _estimate_workspace_from_calibration(self, sample_count: int = 1200) -> Dict[str, Any]:
+        """Estimate reachable XYZ bounds by sampling joint angles within calibration limits and running FK.
+
+        This does NOT move motors; it uses FK + saved calibration limits only.
+        """
+        estimate: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "method": "fk_sampling_from_calibration",
+            "sample_count": int(sample_count),
+            "joint_limits_deg": {},
+            "ee_bounds_mm": {},
+            "ee_percentiles_mm": {},
+        }
+        if self.kinematics is None:
+            estimate["error"] = "kinematics_unavailable"
+            return estimate
+
+        joint_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+        limits = self._joint_limits_deg_from_calibration()
+        # Fallback conservative defaults if calibration missing
+        fallback = {
+            "shoulder_pan": (-90.0, 90.0),
+            "shoulder_lift": (-90.0, 90.0),
+            "elbow_flex": (-90.0, 90.0),
+            "wrist_flex": (-90.0, 90.0),
+            "wrist_roll": (-170.0, 170.0),
+        }
+        for j in joint_names:
+            lo, hi = fallback[j]
+            if j in limits:
+                lo = float(limits[j]["min"])
+                hi = float(limits[j]["max"])
+            estimate["joint_limits_deg"][j] = {"min": lo, "max": hi}
+
+        # Sample
+        xs: list[float] = []
+        ys: list[float] = []
+        zs: list[float] = []
+
+        rng = np.random.default_rng(0)
+        for _ in range(int(sample_count)):
+            q = []
+            for j in joint_names:
+                lo = estimate["joint_limits_deg"][j]["min"]
+                hi = estimate["joint_limits_deg"][j]["max"]
+                q.append(float(rng.uniform(lo, hi)))
+            try:
+                T = self.kinematics.forward_kinematics(np.array(q, dtype=float))
+                xs.append(float(T[0, 3] * 1000.0))
+                ys.append(float(T[1, 3] * 1000.0))
+                zs.append(float(T[2, 3] * 1000.0))
+            except Exception:
+                continue
+
+        if not xs:
+            estimate["error"] = "fk_failed_no_samples"
+            return estimate
+
+        arr = np.array([xs, ys, zs], dtype=float)
+        mins = arr.min(axis=1)
+        maxs = arr.max(axis=1)
+        p5 = np.percentile(arr, 5, axis=1)
+        p95 = np.percentile(arr, 95, axis=1)
+
+        estimate["ee_bounds_mm"] = {
+            "x_min": float(mins[0]),
+            "x_max": float(maxs[0]),
+            "y_min": float(mins[1]),
+            "y_max": float(maxs[1]),
+            "z_min": float(mins[2]),
+            "z_max": float(maxs[2]),
+        }
+        estimate["ee_percentiles_mm"] = {
+            "x_p5": float(p5[0]),
+            "x_p95": float(p95[0]),
+            "y_p5": float(p5[1]),
+            "y_p95": float(p95[1]),
+            "z_p5": float(p5[2]),
+            "z_p95": float(p95[2]),
+        }
+
+        # Recommend a stable "scan posture" near mid-range (useful for startup sweeps)
+        rec = {}
+        for j in joint_names:
+            lo = estimate["joint_limits_deg"][j]["min"]
+            hi = estimate["joint_limits_deg"][j]["max"]
+            rec[j] = float((lo + hi) / 2.0)
+        # Encourage a downward-looking camera by biasing wrist_flex negative if allowed
+        wf_lo = estimate["joint_limits_deg"]["wrist_flex"]["min"]
+        wf_hi = estimate["joint_limits_deg"]["wrist_flex"]["max"]
+        rec["wrist_flex"] = float(np.clip(-30.0, wf_lo, wf_hi))
+        wr_lo = estimate["joint_limits_deg"]["wrist_roll"]["min"]
+        wr_hi = estimate["joint_limits_deg"]["wrist_roll"]["max"]
+        rec["wrist_roll"] = float(np.clip(0.0, wr_lo, wr_hi))
+        estimate["recommended_scan_pose_deg"] = rec
+
+        return estimate
     
     def setup_robot(self):
         """Initialize robot connection."""
+        if not self.port:
+            print("⚠️ No port specified - robot connection will be skipped. Connect USB and restart with --port")
+            self.bus = None
+            self.all_motors = {}
+            return
+            
         calib_file = Path.home() / ".cache/huggingface/lerobot/calibration/robots/so101_follower/so101_chess.json"
         
         with open(calib_file) as f:
@@ -1119,7 +1328,9 @@ class ChessRobotUILLM(QMainWindow):
             index_or_path=0,
             width=640,
             height=480,
-            fps=30
+            fps=30,
+            # Use BGR so downstream cv2 conversions (BGR->RGB for Qt/JPEG) are consistent.
+            color_mode=ColorMode.BGR,
         )
         self.gripper_camera = OpenCVCamera(gripper_camera_cfg)
         
@@ -1137,14 +1348,33 @@ class ChessRobotUILLM(QMainWindow):
     def setup_kinematics(self):
         """Initialize robot kinematics for forward kinematics calculations."""
         try:
-            # Check if URDF exists
-            urdf_path = "./SO101/so101_new_calib.urdf"
-            if not Path(urdf_path).exists():
-                urdf_path = None
+            # Check if URDF exists - try multiple locations
+            # Prefer a meshless copy of the provided URDF (preserves exact kinematics without requiring STL assets)
+            possible_paths = [
+                "./so101_new_calib.nomesh.urdf",  # Preferred: exact kinematics, no mesh files
+                "./so101_kinematics.urdf",  # Simplified kinematics-only URDF
+                "./so101_new_calib.urdf",  # Full URDF (needs mesh files)
+                "./SO101/so101_new_calib.urdf",  # SO101 subdirectory
+                Path(__file__).parent / "so101_new_calib.nomesh.urdf",  # Relative to script
+                Path(__file__).parent / "so101_kinematics.urdf",  # Relative to script
+            ]
+            
+            urdf_path = None
+            for path in possible_paths:
+                if Path(path).exists():
+                    urdf_path = str(path)
+                    print(f"✅ Found URDF at: {urdf_path}")
+                    break
+            
+            if urdf_path is None:
                 print("⚠️ URDF not found - using simplified coordinate calculation")
+                print(f"   Searched: {[str(p) for p in possible_paths]}")
             
             if urdf_path:
-                joint_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+                # IMPORTANT: exclude the jaw joint ("gripper") from IK/FK for end-effector pose.
+                # The `gripper_frame_link` is attached to `gripper_link` via a fixed joint, so the jaw DOF does
+                # not affect the end-effector pose but can destabilize the IK solver if included.
+                joint_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
                 self.kinematics = RobotKinematics(
                     urdf_path=urdf_path,
                     target_frame_name="gripper_frame_link", 
@@ -1771,6 +2001,37 @@ class ChessRobotUILLM(QMainWindow):
         """)
         QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self.open_position_calibration)
         control_layout.addWidget(positions_btn)
+
+        # Workspace estimate button
+        workspace_btn = QPushButton("WORKSPACE")
+        workspace_btn.setToolTip("Estimate reachable workspace from calibration limits (no motion) (Ctrl+W)")
+        workspace_btn.clicked.connect(self.run_workspace_estimate)
+        QShortcut(QKeySequence("Ctrl+W"), self).activated.connect(self.run_workspace_estimate)
+        control_layout.addWidget(workspace_btn)
+
+        # Board view localization (motor+camera) - find shoulder_pan center for the board
+        localize_btn = QPushButton("LOCALIZE")
+        localize_btn.setToolTip("Calibrate board-in-view centering (uses camera + shoulder_pan) (Ctrl+L)")
+        localize_btn.clicked.connect(self.run_board_localize)
+        QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self.run_board_localize)
+        control_layout.addWidget(localize_btn)
+
+        # Pick Pawn button (closed-loop, gripper-camera-only)
+        pick_pawn_btn = QPushButton("PICK PAWN")
+        pick_pawn_btn.setToolTip("Find the pawn and pick it up using only the gripper camera (Ctrl+G)")
+        pick_pawn_btn.clicked.connect(self.pick_pawn)
+        pick_pawn_btn.setStyleSheet("""
+            QPushButton {
+                background: #2ea043;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #3fb950;
+            }
+        """)
+        QShortcut(QKeySequence("Ctrl+G"), self).activated.connect(self.pick_pawn)
+        control_layout.addWidget(pick_pawn_btn)
         
         control_layout.addStretch()
         
@@ -1787,6 +2048,196 @@ class ChessRobotUILLM(QMainWindow):
         control_layout.addWidget(self.status_bar, 1)
         
         parent_layout.addWidget(control_frame)
+
+    def pick_pawn(self):
+        """Convenience UI entrypoint for the auto pick routine."""
+        if not self.llm_enabled or not self.llm_client:
+            self.status_bar.setText("❌ LLM not available (needed for pawn localization)")
+            return
+        # Reuse existing threaded execution path (so UI stays responsive)
+        self.llm_command_input.setPlainText("pick pawn")
+        self._start_llm_execution_thread()
+
+    def run_workspace_estimate(self):
+        """Recompute workspace estimate (no motion) and display summary in logs."""
+        try:
+            self._append_exec_log("info", "Workspace: estimating reachable XYZ bounds (no motion)...")
+            est = self._estimate_workspace_from_calibration(sample_count=1800)
+            self.workspace_estimate = est
+            self._save_workspace_estimate(est)
+            b = (est or {}).get("ee_percentiles_mm") or {}
+            jl = (est or {}).get("joint_limits_deg") or {}
+            msg = (
+                f"Workspace estimate saved. EE p5/p95 (mm): "
+                f"x={b.get('x_p5', 0):.0f}..{b.get('x_p95', 0):.0f}, "
+                f"y={b.get('y_p5', 0):.0f}..{b.get('y_p95', 0):.0f}, "
+                f"z={b.get('z_p5', 0):.0f}..{b.get('z_p95', 0):.0f}"
+            )
+            self._append_exec_log("info", msg)
+            # Also show which way the camera should look (recommended scan pose)
+            rec = (est or {}).get("recommended_scan_pose_deg") or {}
+            if rec:
+                self._append_exec_log("info", f"Recommended scan pose (deg): {json.dumps(rec)}")
+        except Exception as e:
+            self._append_exec_log("error", f"Workspace estimate failed: {e}")
+
+    def run_board_localize(self):
+        """Vision+motor localization: learn what shoulder_pan angle centers the board in the camera view.
+
+        This is a safe routine: it only sweeps shoulder_pan (motor 1) in small increments and uses the LLM
+        (vision) to detect the chessboard center/bbox in the camera image (no OpenCV detection).
+        """
+        if not getattr(self, "bus", None) or not getattr(self.bus, "is_connected", False):
+            self._append_exec_log("error", "Localize: robot bus not connected")
+            return
+        if not getattr(self, "gripper_camera", None) or not getattr(self.gripper_camera, "is_connected", False):
+            self._append_exec_log("error", "Localize: gripper camera not connected")
+            return
+        if not getattr(self, "llm_enabled", False) or not getattr(self, "llm_client", None):
+            self._append_exec_log("error", "Localize: LLM not available (needed for vision-based board detection)")
+            return
+        if self.kinematics is None:
+            self._append_exec_log("warning", "Localize: kinematics not available (continuing anyway)")
+
+        # Pause monitoring thread to avoid serial conflicts during reads/writes
+        was_paused = False
+        if hasattr(self, "monitor_thread") and self.monitor_thread:
+            was_paused = self.monitor_thread.paused
+            self.monitor_thread.paused = True
+            time.sleep(0.2)
+
+        try:
+            self._append_exec_log("info", "Localize: starting board centering scan (pan-only)...")
+
+            # Read current joint positions (best effort)
+            self.update_position_model()
+            cur = dict(self.position_model.get("joints", {}))
+            pan = float(cur.get("shoulder_pan", 0.0))
+            roll = float(cur.get("wrist_roll", 0.0))
+
+            # Pan limits from workspace estimate if available
+            pan_lo, pan_hi = -90.0, 90.0
+            try:
+                jl = (getattr(self, "workspace_estimate", None) or {}).get("joint_limits_deg") or {}
+                if isinstance(jl.get("shoulder_pan"), dict):
+                    pan_lo = float(jl["shoulder_pan"].get("min", pan_lo))
+                    pan_hi = float(jl["shoulder_pan"].get("max", pan_hi))
+            except Exception:
+                pass
+
+            # Sweep targets (15° increments, bounded)
+            span = 75.0
+            step = 15.0
+            raw_targets = [pan + d for d in np.arange(-span, span + 0.1, step)]
+            targets = []
+            for t in raw_targets:
+                tt = float(np.clip(t, pan_lo, pan_hi))
+                if not targets or abs(tt - targets[-1]) > 1e-3:
+                    targets.append(tt)
+
+            best = None
+            best_pan = None
+            best_errx = None
+            best_area = None
+
+            for tpan in targets:
+                # Move pan only (small deltas between steps)
+                act = {"shoulder_pan.pos": float(tpan)}
+                safe = self._validate_llm_action(act, cur)
+                if safe:
+                    self._execute_llm_action(safe)
+                    time.sleep(0.5)
+                    self.update_position_model()
+                    cur = dict(self.position_model.get("joints", {}))
+
+                # LLM vision detection (board bbox/center)
+                img = self.capture_camera_image("gripper")
+                det = self._llm_locate_chessboard(img) if img else None
+                if det and det.get("found") and float(det.get("confidence", 0.0)) >= 0.25:
+                    cx = float((det.get("center_norm") or {}).get("x", 0.5))
+                    errx = cx - 0.5
+                    bb = det.get("bbox_norm") or {}
+                    area = max(0.0, float(bb.get("x2", 0.0)) - float(bb.get("x1", 0.0))) * max(
+                        0.0, float(bb.get("y2", 0.0)) - float(bb.get("y1", 0.0))
+                    )
+                    conf = float(det.get("confidence", 0.0))
+                    ang = det.get("angle_deg", None)
+                    msg = f"Localize: pan={tpan:+.1f}° board_x={cx:.3f} errx={errx:+.3f} conf={conf:.2f} area={area:.3f} angle={ang}"
+                    self._append_exec_log("info", msg)
+
+                    # Choose by smallest |errx|; tie-break by larger area*confidence
+                    tie_score = area * conf
+                    best_tie = (best_area or 0.0) * float((best or {}).get("confidence", 0.0)) if best else -1.0
+                    if (
+                        best is None
+                        or abs(errx) < abs(best_errx)
+                        or (abs(errx) == abs(best_errx) and tie_score > best_tie)
+                    ):
+                        best = det
+                        best_pan = float(tpan)
+                        best_errx = float(errx)
+                        best_area = float(area)
+                else:
+                    conf = float((det or {}).get("confidence", 0.0)) if det else 0.0
+                    noted = (det or {}).get("notes", "") if det else ""
+                    self._append_exec_log("warning", f"Localize: pan={tpan:+.1f}° board not detected (conf={conf:.2f}) {noted}".strip())
+
+            if not best:
+                self._append_exec_log("error", "Localize: chessboard not detected anywhere in sweep. Try an OVERVIEW pose and rerun.")
+                return
+
+            # Refine pan center with a small probe (optional)
+            probe_step = 5.0
+            pan_center = best_pan
+            try:
+                # At best_pan, estimate sensitivity d(errx)/d(pan)
+                det0 = best
+                err0 = float((det0.get("center_norm") or {}).get("x", 0.5)) - 0.5
+                pan2 = float(np.clip(best_pan + probe_step, pan_lo, pan_hi))
+                if abs(pan2 - best_pan) > 1e-3:
+                    safe = self._validate_llm_action({"shoulder_pan.pos": pan2}, cur)
+                    if safe:
+                        self._execute_llm_action(safe)
+                        time.sleep(0.5)
+                        img2 = self.capture_camera_image("gripper")
+                        det1 = self._llm_locate_chessboard(img2) if img2 else None
+                        # Go back
+                        safe = self._validate_llm_action({"shoulder_pan.pos": best_pan}, cur)
+                        if safe:
+                            self._execute_llm_action(safe)
+                            time.sleep(0.4)
+                        if det1 and det1.get("found") and float(det1.get("confidence", 0.0)) >= 0.25:
+                            err1 = float((det1.get("center_norm") or {}).get("x", 0.5)) - 0.5
+                            sens = (err1 - err0) / (pan2 - best_pan)
+                            if abs(sens) > 1e-4:
+                                delta = float(np.clip(-err0 / sens, -12.0, 12.0))
+                                pan_center = float(np.clip(best_pan + delta, pan_lo, pan_hi))
+            except Exception:
+                pass
+
+            # Save calibration
+            calib = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "pan_center_deg": float(pan_center),
+                "pan_limits_deg": {"min": float(pan_lo), "max": float(pan_hi)},
+                "wrist_roll_at_calibration_deg": float(roll),
+                "board_center_norm": best.get("center_norm"),
+                "board_angle_deg": best.get("angle_deg", None),
+                "note": "pan_center_deg is the shoulder_pan angle that best centers the detected board in the image.",
+            }
+            self.board_view_calibration = calib
+            self._save_board_view_calibration(calib)
+
+            # Report key metric the user asked for: m1 (shoulder_pan) centeredness
+            self.update_position_model()
+            cur = dict(self.position_model.get("joints", {}))
+            cur_pan = float(cur.get("shoulder_pan", 0.0))
+            pan_err = cur_pan - float(pan_center)
+            self._append_exec_log("info", f"✅ Localize saved: pan_center={pan_center:+.1f}°. Current m1 error={pan_err:+.1f}° (shoulder_pan - pan_center).")
+            self._append_exec_log("info", f"Tip: keep wrist_roll near 0° while scanning; current roll={float(cur.get('wrist_roll', 0.0)):+.1f}°")
+        finally:
+            if hasattr(self, "monitor_thread") and self.monitor_thread:
+                self.monitor_thread.paused = was_paused
         
     def create_workspace_control_panel(self, parent_layout):
         """Create workspace visualization and control panel."""
@@ -2107,6 +2558,9 @@ class ChessRobotUILLM(QMainWindow):
         llm_layout = QVBoxLayout(llm_group)
         llm_layout.setSpacing(10)
         llm_layout.setContentsMargins(12, 15, 12, 12)
+
+        # Keep a reference so we can adjust prominence during execution
+        self._llm_panel_layout = llm_layout
         
         # Model selection row
         model_row = QHBoxLayout()
@@ -2239,6 +2693,24 @@ class ChessRobotUILLM(QMainWindow):
         """)
         llm_layout.addWidget(execute_btn)
         
+        # Execution logs (prominent during loop)
+        exec_log_label = QLabel("Execution Log (live):")
+        exec_log_label.setStyleSheet("color: #f85149; margin-top: 6px; font-weight: bold;")
+        llm_layout.addWidget(exec_log_label)
+        self.exec_log_display = QTextEdit()
+        self.exec_log_display.setReadOnly(True)
+        self.exec_log_display.setPlaceholderText("Execution logs will appear here (errors, warnings, motor read failures, overloads, IK issues).")
+        self.exec_log_display.setStyleSheet("color: #c9d1d9;")
+        self.exec_log_display.setMinimumHeight(180)
+        llm_layout.addWidget(self.exec_log_display, 2)
+
+        # Connect thread-safe log signals once the widget exists
+        if not hasattr(self, "_exec_log_signals_connected"):
+            self.exec_log_line_signal.connect(self._on_exec_log_line)
+            self.exec_log_reset_signal.connect(self._on_exec_log_reset)
+            self.execution_ui_mode_signal.connect(self._on_execution_ui_mode)
+            self._exec_log_signals_connected = True
+
         # Response sections with scroll areas
         # Reasoning
         llm_layout.addWidget(QLabel("Reasoning:"))
@@ -2246,7 +2718,7 @@ class ChessRobotUILLM(QMainWindow):
         self.llm_reasoning_display.setReadOnly(True)
         self.llm_reasoning_display.setPlaceholderText("LLM reasoning will appear here...")
         self.llm_reasoning_display.setStyleSheet("color: #f0883e;")
-        llm_layout.addWidget(self.llm_reasoning_display, 2)  # More stretch
+        llm_layout.addWidget(self.llm_reasoning_display, 1)
         
         # JSON Response (collapsible)
         response_label = QLabel("Full Response (JSON):")
@@ -2301,6 +2773,80 @@ class ChessRobotUILLM(QMainWindow):
             else:
                 self.vision_status_label.setText("📷 Vision ready")
                 self.vision_status_label.setStyleSheet("color: #58a6ff; font-size: 9pt;")
+
+    def _format_exec_log_line(self, level: str, message: str) -> str:
+        ts = datetime.now().strftime("%H:%M:%S")
+        lvl = (level or "info").upper()
+        return f"{ts} [{lvl}] {message}"
+
+    def _clear_exec_log(self):
+        self._exec_log_lines.clear()
+        # UI updates must be in the main thread; use signal
+        try:
+            self.exec_log_reset_signal.emit()
+        except Exception:
+            pass
+
+    def _append_exec_log(self, level: str, message: str):
+        """Append a log line to the in-memory buffer and UI (thread-safe via Qt signals)."""
+        line = self._format_exec_log_line(level, message)
+        self._exec_log_lines.append(line)
+        try:
+            self.exec_log_line_signal.emit(line)
+        except Exception:
+            pass
+
+    def _get_recent_exec_logs_for_prompt(self) -> str:
+        """Return recent execution log lines for LLM context."""
+        if not self._exec_log_lines:
+            return ""
+        return "\n".join(list(self._exec_log_lines)[-self._exec_log_prompt_max_lines :])
+
+    def _set_execution_ui_mode(self, active: bool):
+        """Make execution logs more prominent during goal-driven runs."""
+        self._execution_active = bool(active)
+        try:
+            self.execution_ui_mode_signal.emit(bool(active))
+        except Exception:
+            pass
+
+    def _on_exec_log_reset(self):
+        """UI thread: clear execution log display."""
+        try:
+            if hasattr(self, "exec_log_display") and self.exec_log_display:
+                self.exec_log_display.clear()
+        except Exception:
+            pass
+
+    def _on_exec_log_line(self, line: str):
+        """UI thread: append a single execution log line."""
+        try:
+            if not hasattr(self, "exec_log_display") or self.exec_log_display is None:
+                return
+            self.exec_log_display.append(line)
+            if self.exec_log_display.document().blockCount() > self._exec_log_display_max_lines:
+                self.exec_log_display.setPlainText("\n".join(list(self._exec_log_lines)[-self._exec_log_display_max_lines :]))
+            cursor = self.exec_log_display.textCursor()
+            cursor.movePosition(cursor.End)
+            self.exec_log_display.setTextCursor(cursor)
+        except Exception:
+            pass
+
+    def _on_execution_ui_mode(self, active: bool):
+        """UI thread: toggle prominence of the log panel during execution."""
+        try:
+            if not hasattr(self, "exec_log_display") or self.exec_log_display is None:
+                return
+            if active:
+                self.exec_log_display.setMinimumHeight(260)
+                if hasattr(self, "llm_response_display") and self.llm_response_display:
+                    self.llm_response_display.setMaximumHeight(110)
+            else:
+                self.exec_log_display.setMinimumHeight(180)
+                if hasattr(self, "llm_response_display") and self.llm_response_display:
+                    self.llm_response_display.setMaximumHeight(150)
+        except Exception:
+            pass
     
     def capture_camera_image(self, camera_source="main"):
         """Capture current frame from specified camera and encode to base64.
@@ -2498,6 +3044,409 @@ class ChessRobotUILLM(QMainWindow):
         except Exception as e:
             print(f"⚠️ Quick vision analysis failed: {e}")
             return None
+
+    def _llm_locate_pawn(self, image_b64: str) -> Optional[Dict[str, Any]]:
+        """Locate a pawn (or any chess piece if pawn classification is uncertain) in the gripper camera image using the LLM.
+
+        Returns JSON (normalized 0..1 coords):
+        {
+          "found": bool,
+          "confidence": 0.0-1.0,
+          "center_norm": {"x": 0..1, "y": 0..1},
+          "bbox_norm": {"x1":0..1,"y1":0..1,"x2":0..1,"y2":0..1},
+          "notes": str
+        }
+        """
+        try:
+            if not self.llm_enabled or not self.llm_client or not image_b64:
+                return None
+
+            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
+
+            prompt = """You are a precise vision locator for a robot gripper camera.
+
+Task: Find a chess piece in view. Prefer a PAWN if you can confidently identify one, but if you are unsure about piece type,
+still return the best candidate chess piece rather than failing.
+
+Important:
+- Return coordinates NORMALIZED to image size: x and y are in [0,1]
+- If there are multiple pieces, choose the piece closest to the image center.
+- Only set found=false if there is clearly NO chess piece visible.
+
+JSON schema:
+{
+  "found": true/false,
+  "confidence": 0.0,
+  "center_norm": {"x": 0.5, "y": 0.5},
+  "bbox_norm": {"x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0},
+  "notes": "brief"
+}
+"""
+
+            user_content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}", "detail": "high"}},
+            ]
+            messages = [
+                {"role": "system", "content": "You are a vision locator. Output only valid JSON."},
+                {"role": "user", "content": user_content},
+            ]
+
+            # Model-appropriate parameters (gpt-5 and o-series require max_completion_tokens)
+            is_o_series = selected_model.startswith("o")
+            is_gpt5 = selected_model.startswith("gpt-5")
+            api_params = {"model": selected_model, "messages": messages}
+            if is_o_series or is_gpt5:
+                api_params["max_completion_tokens"] = 300
+            else:
+                api_params["max_tokens"] = 300
+
+            # Structured JSON output where supported (not for o-series)
+            if not is_o_series:
+                api_params["response_format"] = {"type": "json_object"}
+                if not is_gpt5:
+                    api_params["temperature"] = 0.0
+
+            resp = self.llm_client.chat.completions.create(**api_params)
+            return json.loads(resp.choices[0].message.content)
+        except Exception as e:
+            print(f"⚠️ Pawn localization failed: {e}")
+            return None
+
+    def _llm_locate_chessboard(self, image_b64: str) -> Optional[Dict[str, Any]]:
+        """Locate the chessboard in the gripper camera image using the LLM.
+
+        Returns JSON (normalized 0..1 coords):
+        {
+          "found": bool,
+          "confidence": 0.0-1.0,
+          "center_norm": {"x": 0..1, "y": 0..1},
+          "bbox_norm": {"x1":0..1,"y1":0..1,"x2":0..1,"y2":0..1},
+          "angle_deg": <float or null>,   // optional: board rotation in image coordinates
+          "notes": str
+        }
+        """
+        try:
+            if not self.llm_enabled or not self.llm_client or not image_b64:
+                return None
+
+            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
+
+            prompt = """You are a precise vision locator for a robot gripper camera.
+
+Task: Locate the CHESSBOARD (the 8x8 board) in the image.
+
+Important:
+- Return coordinates NORMALIZED to image size: x and y are in [0,1]
+- If the board is partially visible, still return the best estimate if you are reasonably confident.
+- Only set found=false if there is clearly NO chessboard visible.
+
+JSON schema:
+{
+  "found": true/false,
+  "confidence": 0.0,
+  "center_norm": {"x": 0.5, "y": 0.5},
+  "bbox_norm": {"x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0},
+  "angle_deg": null,
+  "notes": "brief"
+}
+"""
+
+            user_content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}", "detail": "high"}},
+            ]
+            messages = [
+                {"role": "system", "content": "You are a vision locator. Output only valid JSON."},
+                {"role": "user", "content": user_content},
+            ]
+
+            # Model-appropriate parameters (gpt-5 and o-series require max_completion_tokens)
+            is_o_series = selected_model.startswith("o")
+            is_gpt5 = selected_model.startswith("gpt-5")
+            api_params = {"model": selected_model, "messages": messages}
+            if is_o_series or is_gpt5:
+                api_params["max_completion_tokens"] = 350
+            else:
+                api_params["max_tokens"] = 350
+
+            # Structured JSON output where supported (not for o-series)
+            if not is_o_series:
+                api_params["response_format"] = {"type": "json_object"}
+                if not is_gpt5:
+                    api_params["temperature"] = 0.0
+
+            resp = self.llm_client.chat.completions.create(**api_params)
+            return json.loads(resp.choices[0].message.content)
+        except Exception as e:
+            print(f"⚠️ Chessboard localization failed: {e}")
+            return None
+
+    def _set_gripper(self, percent: float):
+        """Set gripper opening percentage (0=open, 100=closed)."""
+        try:
+            if "gripper" not in self.all_motors:
+                return
+            val = max(0.0, min(100.0, float(percent)))
+            self.bus.write("Goal_Position", "gripper", val, normalize=True)
+            time.sleep(0.25)
+        except Exception as e:
+            print(f"⚠️ Gripper command failed: {e}")
+
+    def _auto_pick_pawn(self, thread: Optional["LLMExecutionThread"] = None) -> Tuple[bool, str]:
+        """Closed-loop routine: overview -> search -> center -> descend -> close -> lift.
+
+        Uses ONLY the gripper camera for perception. The LLM is used only to localize the pawn in the image.
+        """
+        def emit_status(msg: str):
+            if thread:
+                thread.status_update.emit(msg)
+            else:
+                self.status_bar.setText(msg)
+
+        def emit_reasoning(msg: str):
+            if thread:
+                thread.reasoning_update.emit(msg)
+            else:
+                self.llm_reasoning_display.setText(msg)
+
+        def emit_response(msg: str):
+            if thread:
+                thread.response_update.emit(msg)
+            else:
+                self.llm_response_display.setText(msg)
+
+        if self.kinematics is None:
+            return False, "Kinematics not available (needed for safe Cartesian moves)"
+
+        emit_status("🧭 Auto pick: moving to overview...")
+        emit_reasoning("Auto pick pawn: overview → search → center → descend → close → lift\n")
+
+        # Open gripper first
+        self._set_gripper(0.0)
+
+        # Helper: try to find a saved pose by fuzzy name
+        def _get_saved_pose(name_candidates: List[str]) -> Optional[Dict[str, float]]:
+            saved = self._load_saved_positions() or {}
+            if not saved:
+                return None
+            # map lower->actual key
+            key_map = {str(k).strip().lower(): k for k in saved.keys()}
+            for cand in name_candidates:
+                k = key_map.get(cand.strip().lower())
+                if k and isinstance(saved.get(k), dict):
+                    pos = saved[k].get("positions")
+                    if isinstance(pos, dict) and pos:
+                        return {m: float(v) for m, v in pos.items() if m in self.all_motors}
+            return None
+
+        # Helper: smooth joint-space move to a target pose in small chunks (avoids one big clamp)
+        def _goto_pose(target: Dict[str, float], steps: int = 4, settle_s: float = 0.7) -> bool:
+            try:
+                self.update_position_model()
+                cur = dict(self.position_model.get("joints", {}))
+                for s in range(1, steps + 1):
+                    if thread and not thread.running:
+                        return False
+                    alpha = s / steps
+                    inter_action = {}
+                    for m, tgt in target.items():
+                        if m not in cur:
+                            continue
+                        inter_action[f"{m}.pos"] = float(cur[m]) + (float(tgt) - float(cur[m])) * alpha
+                    safe = self._validate_llm_action(inter_action, cur, is_sequence_step=True)
+                    if safe:
+                        self._execute_llm_action(safe)
+                        time.sleep(settle_s)
+                        self.update_position_model()
+                        cur = dict(self.position_model.get("joints", {}))
+                return True
+            except Exception as e:
+                print(f"⚠️ goto_pose failed: {e}")
+                return False
+
+        # Go to a safe overview pose (prefer user's saved Overview/Ready)
+        self.update_position_model()
+        current_positions = dict(self.position_model.get("joints", {}))
+        saved_overview = _get_saved_pose(["overview", "Overview", "OVERVIEW", "ready", "Ready"])
+        if saved_overview:
+            emit_status("🧭 Auto pick: going to saved OVERVIEW/READY pose...")
+            _goto_pose(saved_overview, steps=5, settle_s=0.7)
+        else:
+            # fallback: generic overview
+            overview_action = {
+                "shoulder_pan.pos": 0.0,
+                "shoulder_lift.pos": 40.0,
+                "elbow_flex.pos": 40.0,
+                "wrist_flex.pos": -30.0,
+                "wrist_roll.pos": 0.0,
+                "gripper.pos": 0.0,
+            }
+            safe_overview = self._validate_llm_action(overview_action, current_positions, is_sequence_step=True)
+            if safe_overview:
+                self._execute_llm_action(safe_overview)
+                time.sleep(0.7)
+
+        # Search by sweeping shoulder_pan a bit until pawn is visible
+        emit_status("🔍 Auto pick: searching for pawn...")
+        # IMPORTANT: sweep is PAN-ONLY to avoid changing height while searching (prevents board hits).
+        # We keep the rest of the joints at the current "overview" pose.
+        sweep_angles = [-75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75, 60, 45, 30, 15, 0, -15, -30, -45, -60]
+        last_obs = None
+        for ang in sweep_angles:
+            if thread and not thread.running:
+                return False, "Cancelled"
+            # Small joint motion for search
+            self.update_position_model()
+            cur = dict(self.position_model.get("joints", {}))
+            act = {"shoulder_pan.pos": float(ang)}
+            safe = self._validate_llm_action(act, cur)
+            if safe:
+                self._execute_llm_action(safe)
+                time.sleep(0.8)  # give camera time to settle (reduces motion blur)
+
+            # Sample multiple frames per angle; accept if ANY sees the piece
+            best = None
+            for _ in range(2):
+                img = self.capture_camera_image("gripper")
+                obs = self._llm_locate_pawn(img) if img else None
+                if obs:
+                    last_obs = obs
+                    if best is None or float(obs.get("confidence", 0.0)) > float(best.get("confidence", 0.0)):
+                        best = obs
+                time.sleep(0.15)
+
+            emit_response(json.dumps(best or last_obs or {"found": False}, indent=2))
+            if best and best.get("found") and float(best.get("confidence", 0.0)) >= 0.35:
+                last_obs = best
+                break
+        else:
+            return False, "Pawn not found in search sweep"
+
+        # Calibrate a simple image Jacobian for (dx,dy)->(image error) using tiny probe moves
+        def get_err(obs: Dict[str, Any]) -> Optional[Tuple[float, float, float]]:
+            try:
+                c = obs.get("center_norm") or {}
+                bx = obs.get("bbox_norm") or {}
+                ex = float(c.get("x", 0.5)) - 0.5
+                ey = float(c.get("y", 0.5)) - 0.5
+                area = max(0.0, float(bx.get("x2", 0.0)) - float(bx.get("x1", 0.0))) * max(
+                    0.0, float(bx.get("y2", 0.0)) - float(bx.get("y1", 0.0))
+                )
+                return ex, ey, area
+            except Exception:
+                return None
+
+        emit_status("🎯 Auto pick: centering pawn...")
+        base_img = self.capture_camera_image("gripper")
+        base_obs = self._llm_locate_pawn(base_img) if base_img else None
+        if not base_obs or not base_obs.get("found"):
+            base_obs = last_obs
+        if not base_obs or not base_obs.get("found"):
+            return False, "Lost pawn before centering"
+
+        base_err = get_err(base_obs)
+        if not base_err:
+            return False, "Pawn localization malformed"
+
+        # Default J (fallback): assume dy affects x-error, dx affects y-error
+        J = np.array([[0.0, 0.015], [0.015, 0.0]], dtype=float)  # error per mm (rough)
+        dx_probe = 6.0
+        dy_probe = 6.0
+        try:
+            # Probe +dx
+            self._move_gripper_mm(dx_probe, 0.0, 0.0, apply_ui_step=False)
+            img1 = self.capture_camera_image("gripper")
+            obs1 = self._llm_locate_pawn(img1) if img1 else None
+            self._move_gripper_mm(-dx_probe, 0.0, 0.0, apply_ui_step=False)
+            # Probe +dy
+            self._move_gripper_mm(0.0, dy_probe, 0.0, apply_ui_step=False)
+            img2 = self.capture_camera_image("gripper")
+            obs2 = self._llm_locate_pawn(img2) if img2 else None
+            self._move_gripper_mm(0.0, -dy_probe, 0.0, apply_ui_step=False)
+
+            e0 = get_err(base_obs)
+            e1 = get_err(obs1) if obs1 and obs1.get("found") else None
+            e2 = get_err(obs2) if obs2 and obs2.get("found") else None
+            if e0 and e1 and e2:
+                J = np.array(
+                    [
+                        [(e1[0] - e0[0]) / dx_probe, (e2[0] - e0[0]) / dy_probe],
+                        [(e1[1] - e0[1]) / dx_probe, (e2[1] - e0[1]) / dy_probe],
+                    ],
+                    dtype=float,
+                )
+        except Exception as e:
+            print(f"⚠️ Jacobian probe failed, using fallback mapping: {e}")
+
+        # Servo loop: center in XY, then descend in Z while re-centering
+        def pinv2(m: np.ndarray) -> np.ndarray:
+            return np.linalg.pinv(m)
+
+        Jinv = pinv2(J)
+        center_tol = 0.06
+        max_center_iters = 10
+
+        for i in range(max_center_iters):
+            if thread and not thread.running:
+                return False, "Cancelled"
+            img = self.capture_camera_image("gripper")
+            obs = self._llm_locate_pawn(img) if img else None
+            if not obs or not obs.get("found"):
+                emit_status("⚠️ Auto pick: lost pawn during centering, re-searching...")
+                return False, "Lost pawn during centering"
+            emit_response(json.dumps(obs, indent=2))
+            ex, ey, area = get_err(obs) or (0.0, 0.0, 0.0)
+            emit_status(f"🎯 Centering: err=({ex:+.3f},{ey:+.3f}) area={area:.3f}")
+            if abs(ex) < center_tol and abs(ey) < center_tol:
+                break
+
+            e = np.array([ex, ey], dtype=float)
+            # Gain: smaller steps when close (area grows as we get closer)
+            gain = 0.65 if area < 0.02 else 0.4
+            dxy = -gain * (Jinv @ e)
+            dx_cmd = float(np.clip(dxy[0] * 100.0, -10.0, 10.0))  # scale to mm
+            dy_cmd = float(np.clip(dxy[1] * 100.0, -10.0, 10.0))
+            self._move_gripper_mm(dx_cmd, dy_cmd, 0.0, apply_ui_step=False)
+
+        # Approach: descend in small increments while keeping centered
+        emit_status("⬇️ Auto pick: approaching pawn...")
+        max_descend_steps = 8
+        for step in range(max_descend_steps):
+            if thread and not thread.running:
+                return False, "Cancelled"
+            img = self.capture_camera_image("gripper")
+            obs = self._llm_locate_pawn(img) if img else None
+            if not obs or not obs.get("found"):
+                return False, "Lost pawn during approach"
+            emit_response(json.dumps(obs, indent=2))
+            ex, ey, area = get_err(obs) or (0.0, 0.0, 0.0)
+
+            # Re-center a bit
+            if abs(ex) > center_tol or abs(ey) > center_tol:
+                e = np.array([ex, ey], dtype=float)
+                dxy = -(0.35 * (Jinv @ e))
+                dx_cmd = float(np.clip(dxy[0] * 100.0, -6.0, 6.0))
+                dy_cmd = float(np.clip(dxy[1] * 100.0, -6.0, 6.0))
+                self._move_gripper_mm(dx_cmd, dy_cmd, 0.0, apply_ui_step=False)
+
+            # If the pawn is "big enough" in view, start grasp
+            if area >= 0.035:
+                break
+
+            # Descend a little (dz clamp inside move)
+            self._move_gripper_mm(0.0, 0.0, -5.0, apply_ui_step=False)
+
+        # Final grasp
+        emit_status("🤏 Auto pick: grasping...")
+        self._move_gripper_mm(0.0, 0.0, -4.0, apply_ui_step=False)
+        self._set_gripper(85.0)
+        time.sleep(0.4)
+        emit_status("⬆️ Auto pick: lifting...")
+        self._move_gripper_mm(0.0, 0.0, +25.0, apply_ui_step=False)
+        time.sleep(0.6)
+
+        return True, "Auto pick completed (check gripper for pawn)"
     
     def _start_llm_execution_thread(self):
         """Start LLM execution in background thread to prevent UI blocking."""
@@ -2519,6 +3468,9 @@ class ChessRobotUILLM(QMainWindow):
         self.llm_command_input.setEnabled(False)
         
         # Initialize UI
+        self._clear_exec_log()
+        self._set_execution_ui_mode(True)
+        self._append_exec_log("info", f"Starting execution: {command}")
         self.status_bar.setText("🎯 Starting goal-driven execution...")
         self.llm_response_display.setText("Initializing...")
         self.llm_reasoning_display.setText(f"Goal: {command}\n\nStarting iterative execution...\n")
@@ -2536,6 +3488,8 @@ class ChessRobotUILLM(QMainWindow):
     def _on_execution_finished(self, success: bool, message: str):
         """Called when execution thread finishes."""
         self.llm_command_input.setEnabled(True)  # Re-enable input
+        self._set_execution_ui_mode(False)
+        self._append_exec_log("info" if success else "error", f"Execution finished: {message}")
         if not success:
             self.status_bar.setText(f"❌ {message}")
     
@@ -2577,6 +3531,9 @@ class ChessRobotUILLM(QMainWindow):
             return
         
         # Initialize goal-driven loop
+        self._clear_exec_log()
+        self._set_execution_ui_mode(True)
+        self._append_exec_log("info", f"Execution started: {command}")
         emit_status("🎯 Starting goal-driven execution...")
         emit_response("Initializing...")
         emit_reasoning(f"Goal: {command}\n\nStarting iterative execution...\n")
@@ -2587,6 +3544,7 @@ class ChessRobotUILLM(QMainWindow):
             self.monitor_thread.paused = True
             time.sleep(0.2)  # Wait for current read to complete
             print("⏸️ Monitoring paused for command execution")
+            self._append_exec_log("info", "Monitoring paused to avoid port conflicts")
         
         # Track iteration history
         iteration_history = []
@@ -2597,6 +3555,21 @@ class ChessRobotUILLM(QMainWindow):
         movement_history = []  # Track recent movements to detect repeated large movements
         
         try:
+            # Special deterministic routines (avoid open-ended LLM joint-guessing)
+            cmd = (command or "").strip().lower()
+            if cmd in {"pick pawn", "pickup pawn", "pick up pawn", "find pawn and pick it up"}:
+                emit_status("🤖 Running auto pick routine...")
+                ok, msg = self._auto_pick_pawn(thread=thread)
+                if ok:
+                    emit_status(f"✅ {msg}")
+                    if thread:
+                        thread.finished_signal.emit(True, msg)
+                else:
+                    emit_status(f"❌ {msg}")
+                    if thread:
+                        thread.finished_signal.emit(False, msg)
+                return
+
             while iteration < max_iterations:
                 if thread and not thread.running:
                     break  # Thread was stopped
@@ -2613,6 +3586,7 @@ class ChessRobotUILLM(QMainWindow):
                         current_positions[motor_name] = pos
                     except:
                         current_positions[motor_name] = self.position_model["joints"].get(motor_name, 0)
+                        self._append_exec_log("warning", f"Read Present_Position failed for {motor_name}; using last-known value")
                 
                 # Capture current image
                 image_data = None
@@ -2813,6 +3787,8 @@ class ChessRobotUILLM(QMainWindow):
             if hasattr(self, 'monitor_thread') and self.monitor_thread:
                 self.monitor_thread.paused = False
                 print("▶️ Monitoring resumed")
+                self._append_exec_log("info", "Monitoring resumed")
+            self._set_execution_ui_mode(False)
     
     def _build_iteration_context(self, original_command: str, current_positions: Dict[str, float], 
                                   iteration: int, history: List[Dict]) -> str:
@@ -2849,6 +3825,9 @@ CURRENT STATE:
 - Current square: {current_square if current_square else "unknown"}
 {board_context}
 {history_text}
+
+RECENT EXECUTION LOGS (critical, read carefully):
+{self._get_recent_exec_logs_for_prompt() if self._get_recent_exec_logs_for_prompt() else "(none)"}
 
 YOUR TASK:
 Based on the goal and current state, determine what action to take NEXT.
@@ -3113,6 +4092,40 @@ Chess Board Calibration:
   * file_index: a=0, b=1, c=2, d=3, e=4, f=5, g=6, h=7
   * rank_index: 1=0, 2=1, 3=2, 4=3, 5=4, 6=5, 7=6, 8=7
 """
+
+        # Workspace estimate (from mechanical/calibration limits)
+        workspace_context = ""
+        if getattr(self, "workspace_estimate", None):
+            we = self.workspace_estimate
+            b = (we or {}).get("ee_percentiles_mm") or {}
+            jl = (we or {}).get("joint_limits_deg") or {}
+            rec = (we or {}).get("recommended_scan_pose_deg") or {}
+            workspace_context = f"""
+WORKSPACE ESTIMATE (from your mechanical/calibration limits; use this to avoid 'looking the wrong way'):
+- Reachable EE p5..p95 (mm): x={b.get('x_p5', 0):.0f}..{b.get('x_p95', 0):.0f}, y={b.get('y_p5', 0):.0f}..{b.get('y_p95', 0):.0f}, z={b.get('z_p5', 0):.0f}..{b.get('z_p95', 0):.0f}
+- Joint limits (deg): {json.dumps(jl)}
+- Recommended SCAN pose (deg): {json.dumps(rec)}
+Notes:
+- Keep wrist_roll near 0° during scanning (prevents camera from looking sideways).
+- Keep wrist_flex negative (e.g. -20° to -45°) to look down at the board.
+"""
+
+        # Board-in-view localization (camera + motor 1)
+        board_view_context = ""
+        try:
+            bvc = getattr(self, "board_view_calibration", None) or {}
+            pan_center = bvc.get("pan_center_deg", None)
+            if pan_center is not None and "shoulder_pan" in current_positions:
+                m1_err = float(current_positions.get("shoulder_pan", 0.0)) - float(pan_center)
+                board_view_context = f"""
+BOARD VIEW LOCALIZATION (camera + motor feedback):
+- Learned board-centered shoulder_pan (m1): pan_center_deg={float(pan_center):+.1f}°
+- Current m1 centeredness error: (shoulder_pan - pan_center_deg) = {m1_err:+.1f}°
+- Use shoulder_pan as the PRIMARY left/right centering control while scanning/approaching.
+- Keep wrist_roll near 0° during scanning (prevents looking sideways).
+"""
+        except Exception:
+            board_view_context = ""
         
         # Load saved/calibrated positions for reference
         saved_positions = self._load_saved_positions()
@@ -3170,7 +4183,7 @@ CURRENT ROBOT STATE:
 - Joint positions: {json.dumps(current_positions, indent=2)}
 - End-effector position: x={ee_x:.1f}mm, y={ee_y:.1f}mm, z={ee_z:.1f}mm
 - Gripper state: {self.position_model.get('gripper', 0):.1f}%
-{board_context}{saved_positions_context}
+{board_context}{workspace_context}{board_view_context}{saved_positions_context}
 USER COMMAND: {command}
 
 CAPABILITIES:
@@ -3265,6 +4278,24 @@ CRITICAL RULES:
             max_change = 40.0  # Larger for planned sequences
         else:
             max_change = 30.0  # More permissive for single actions
+
+        # Joint-specific bounds (degrees): prefer measured/calibration-derived limits if available.
+        joint_bounds_deg = {
+            "shoulder_pan": (-110.0, 110.0),
+            "shoulder_lift": (-100.0, 100.0),
+            "elbow_flex": (-100.0, 100.0),
+            "wrist_flex": (-100.0, 100.0),
+            "wrist_roll": (-170.0, 170.0),
+        }
+        try:
+            we = getattr(self, "workspace_estimate", None)
+            jl = (we or {}).get("joint_limits_deg") if we else None
+            if isinstance(jl, dict):
+                for j, lim in jl.items():
+                    if j in joint_bounds_deg and isinstance(lim, dict) and "min" in lim and "max" in lim:
+                        joint_bounds_deg[j] = (float(lim["min"]), float(lim["max"]))
+        except Exception:
+            pass
         
         for motor_name, value in action.items():
             # Remove .pos suffix if present
@@ -3293,8 +4324,9 @@ CRITICAL RULES:
                 if motor_key == "gripper":
                     target_value = max(0.0, min(100.0, target_value))
                 else:
-                    # Joint angle validation (rough bounds)
-                    target_value = max(-180.0, min(180.0, target_value))
+                    # Joint angle validation (tighter, motor-specific bounds)
+                    lo, hi = joint_bounds_deg.get(motor_key, (-180.0, 180.0))
+                    target_value = max(lo, min(hi, target_value))
                 
                 safe_action[f"{motor_key}.pos"] = target_value
                 
@@ -3304,8 +4336,54 @@ CRITICAL RULES:
         
         if not safe_action:
             print("⚠️ Validation failed: no valid motors in action")
+
+        if not safe_action:
+            return None
+
+        # Extra safety: if kinematics is available, limit how much the LLM can DROP the end-effector Z per step.
+        # This reduces repeated "banging down" even when the LLM keeps requesting to lower.
+        try:
+            if self.kinematics is not None:
+                cur_j = {k: v for k, v in current_positions.items() if k != "gripper"}
+                _, _, z_cur, _ = self.calculate_base_coordinates(cur_j)
+
+                pred = dict(current_positions)
+                for k, v in safe_action.items():
+                    pred[k.replace(".pos", "")] = float(v)
+                pred_j = {k: v for k, v in pred.items() if k != "gripper"}
+                _, _, z_pred, _ = self.calculate_base_coordinates(pred_j)
+
+                if isinstance(z_cur, (int, float)) and isinstance(z_pred, (int, float)):
+                    max_z_drop_mm = 20.0 if is_sequence_step else 15.0
+                    if (z_cur - z_pred) > max_z_drop_mm:
+                        lo, hi = 0.0, 1.0
+                        best = 0.0
+                        joints = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+                        base_targets = {j: float(safe_action.get(f"{j}.pos", current_positions.get(j, 0.0))) for j in joints}
+                        base_curr = {j: float(current_positions.get(j, 0.0)) for j in joints}
+
+                        for _ in range(10):
+                            mid = (lo + hi) / 2.0
+                            trial = dict(current_positions)
+                            for j in joints:
+                                trial[j] = base_curr[j] + (base_targets[j] - base_curr[j]) * mid
+                            trial_j = {k: v for k, v in trial.items() if k != "gripper"}
+                            _, _, z_trial, _ = self.calculate_base_coordinates(trial_j)
+                            if isinstance(z_trial, (int, float)) and (z_cur - z_trial) <= max_z_drop_mm:
+                                best = mid
+                                lo = mid
+                            else:
+                                hi = mid
+
+                        if best < 1.0:
+                            for j in joints:
+                                if f"{j}.pos" in safe_action:
+                                    safe_action[f"{j}.pos"] = base_curr[j] + (base_targets[j] - base_curr[j]) * best
+                            print(f"⚠️ Z-drop safety: scaled action to {best:.2f} to limit Δz to {max_z_drop_mm:.0f}mm")
+        except Exception:
+            pass
         
-        return safe_action if safe_action else None
+        return safe_action
     
     def _execute_llm_action(self, action: Dict[str, float]):
         """Execute validated LLM action on robot with COORDINATED multi-motor movement.
@@ -3664,13 +4742,27 @@ Guidelines:
             print(f"⚠️ Adaptive feedback failed: {e}")
             return None
     
-    def move_gripper(self, dx_mm, dy_mm, dz_mm):
-        """Move gripper by specified amounts in base coordinates."""
+    def _move_gripper_mm(self, dx_mm, dy_mm, dz_mm, apply_ui_step: bool = True):
+        """Move gripper in base coordinates by the specified delta (in mm).
+
+        If apply_ui_step=True, the UI step-size multiplier is applied (for button nudges).
+        If apply_ui_step=False, dx_mm/dy_mm/dz_mm are treated as direct millimeters (for autopick logic).
+        """
         try:
-            step_size = float(self.step_size_combo.currentText())
-            dx = dx_mm * step_size / 10.0
-            dy = dy_mm * step_size / 10.0
-            dz = dz_mm * step_size / 10.0
+            if apply_ui_step:
+                step_size = float(self.step_size_combo.currentText())
+                dx = float(dx_mm) * step_size / 10.0
+                dy = float(dy_mm) * step_size / 10.0
+                dz = float(dz_mm) * step_size / 10.0
+            else:
+                dx = float(dx_mm)
+                dy = float(dy_mm)
+                dz = float(dz_mm)
+
+            # Safety: avoid "slamming" downward into the board/table.
+            max_down_mm = 8.0
+            if dz < -max_down_mm:
+                dz = -max_down_mm
             
             self.status_bar.setText(f"🎯 Moving gripper: Δx={dx:.1f}, Δy={dy:.1f}, Δz={dz:.1f} mm")
             
@@ -3678,50 +4770,68 @@ Guidelines:
             current_joints = {}
             for motor_name in self.all_motors.keys():
                 if motor_name != "gripper":
-                    pos = self.bus.read("Present_Position", motor_name, normalize=True)
-                    current_joints[motor_name] = pos
+                    # Prefer live read, but fall back to last-known to avoid hard failures mid-run.
+                    last_known = None
+                    try:
+                        last_known = self.position_model.get("joints", {}).get(motor_name, None)
+                    except Exception:
+                        last_known = None
+                    try:
+                        pos = self.bus.read("Present_Position", motor_name, normalize=True, num_retry=2)
+                        current_joints[motor_name] = pos
+                    except Exception as e:
+                        self._append_exec_log("error", f"Movement read failed: Present_Position {motor_name}: {e}")
+                        if last_known is not None:
+                            current_joints[motor_name] = float(last_known)
+                            self._append_exec_log("warning", f"Using last-known {motor_name}={float(last_known):.1f}° for IK")
+                        else:
+                            raise
             
-            # Get current end-effector position
-            current_x, current_y, current_z, _ = self.calculate_base_coordinates(current_joints)
-            
-            # Calculate target position
-            target_x = current_x + dx
-            target_y = current_y + dy  
-            target_z = current_z + dz
-            
-            # Check workspace bounds
-            distance = np.sqrt(target_x**2 + target_y**2 + target_z**2)
-            if distance > 450:
-                self.status_bar.setText("❌ Target outside workspace bounds!")
-                return
-            
-            if distance < 80:
-                self.status_bar.setText("❌ Target too close to base!")
-                return
-                
             # Use inverse kinematics if available
             if self.kinematics is not None:
                 try:
-                    # Create target transformation matrix
-                    T_target = np.eye(4)
-                    T_target[0, 3] = target_x / 1000.0
-                    T_target[1, 3] = target_y / 1000.0
-                    T_target[2, 3] = target_z / 1000.0
-                    
-                    # Calculate required joint angles
-                    current_joint_array = [current_joints[name] for name in 
-                                         ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]]
-                    
-                    target_joints = self.kinematics.inverse_kinematics(current_joint_array, T_target)
-                    
-                    # Execute movement with small increments
                     joint_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+                    current_joint_array = [float(current_joints[name]) for name in joint_names]
+
+                    # Preserve current orientation; translate only.
+                    T_current = self.kinematics.forward_kinematics(current_joint_array)
+                    T_target = np.array(T_current, copy=True)
+                    T_target[0, 3] += dx / 1000.0
+                    T_target[1, 3] += dy / 1000.0
+                    T_target[2, 3] += dz / 1000.0
+
+                    # Check workspace bounds in mm (coarse safety)
+                    target_x = float(T_target[0, 3] * 1000.0)
+                    target_y = float(T_target[1, 3] * 1000.0)
+                    target_z = float(T_target[2, 3] * 1000.0)
+                    distance = float(np.sqrt(target_x**2 + target_y**2 + target_z**2))
+                    if distance > 450:
+                        self.status_bar.setText("❌ Target outside workspace bounds!")
+                        return
+                    if distance < 80:
+                        self.status_bar.setText("❌ Target too close to base!")
+                        return
+
+                    # Solve IK
+                    target_joints = self.kinematics.inverse_kinematics(
+                        current_joint_array, T_target, position_weight=1.0, orientation_weight=0.02
+                    )
+
+                    # Clamp per-joint change (deg) and move all joints together
+                    max_joint_step_deg = 8.0
+                    motor_positions = {}
                     for i, motor_name in enumerate(joint_names):
-                        if i < len(target_joints):
-                            self.bus.write("Goal_Position", motor_name, float(target_joints[i]))
-                            time.sleep(0.2)
-                    
-                    self.status_bar.setText(f"✅ Moved to ({target_x:.1f}, {target_y:.1f}, {target_z:.1f})")
+                        cur = float(current_joints[motor_name])
+                        tgt = float(target_joints[i]) if i < len(target_joints) else cur
+                        delta = tgt - cur
+                        if abs(delta) > max_joint_step_deg:
+                            tgt = cur + max_joint_step_deg * (1.0 if delta > 0 else -1.0)
+                        motor_positions[motor_name] = tgt
+
+                    self.bus.sync_write("Goal_Position", motor_positions, normalize=True)
+                    time.sleep(0.4)
+
+                    self.status_bar.setText(f"✅ Moved toward ({target_x:.1f}, {target_y:.1f}, {target_z:.1f})")
                     
                 except Exception as e:
                     self.status_bar.setText(f"❌ IK failed: {str(e)[:50]}...")
@@ -3745,7 +4855,13 @@ Guidelines:
                 self.status_bar.setText("✅ Joint movement completed")
         
         except Exception as e:
-            self.status_bar.setText(f"❌ Movement failed: {str(e)[:50]}...")
+            # Full error goes to execution log; status bar is short by design.
+            self._append_exec_log("error", f"Movement failed: {e}")
+            self.status_bar.setText("❌ Movement failed (see Execution Log)")
+
+    def move_gripper(self, dx_mm, dy_mm, dz_mm):
+        """UI-friendly wrapper: uses the step-size combo scaling."""
+        return self._move_gripper_mm(dx_mm, dy_mm, dz_mm, apply_ui_step=True)
     
     def update_workspace_position(self, x_mm, y_mm, z_mm):
         """Update robot position on workspace visualization."""
@@ -5734,7 +6850,7 @@ class PositionCalibrationDialog(QDialog):
 def main():
     import argparse
     p = argparse.ArgumentParser(description="Chess Robot Monitoring UI with ChatKit LLM Control")
-    p.add_argument("--port", required=True, help="Robot serial port")
+    p.add_argument("--port", required=False, help="Robot serial port (optional - can be selected in UI)")
     p.add_argument("--dev", action="store_true", help="Enable development mode with file watching")
     p.add_argument("--api-key", type=str, help="OpenAI API key (or set OPENAI_API_KEY env var)")
     p.add_argument("--workflow-id", type=str, help="ChatKit workflow ID from Agent Builder (or set OPENAI_CHATKIT_WORKFLOW_ID env var)")
