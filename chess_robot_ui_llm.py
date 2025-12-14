@@ -1101,6 +1101,42 @@ class ChessRobotUILLM(QMainWindow):
         except Exception:
             pass
 
+    def _get_dz_to_kinematics_sign(self) -> float:
+        """Return the sign that maps semantic dz (+up) to the kinematics Z axis.
+
+        - If this returns +1, then +dz increases FK Z (default).
+        - If this returns -1, then +dz DECREASES FK Z (invert z axis).
+
+        This is persisted in `board_view_calibration.json` so tool calls and UI stay consistent.
+        """
+        try:
+            bvc = getattr(self, "board_view_calibration", None) or {}
+            if not bvc:
+                bvc = self._load_board_view_calibration() or {}
+            val = float(bvc.get("dz_to_kinematics_sign", 1.0))
+            return 1.0 if val >= 0 else -1.0
+        except Exception:
+            return 1.0
+
+    def _set_dz_to_kinematics_sign(self, sign: float, set_by: str = "manual") -> None:
+        """Persist dz-to-kinematics sign mapping (+1 normal, -1 inverted)."""
+        try:
+            s = 1.0 if float(sign) >= 0 else -1.0
+            calib = dict(getattr(self, "board_view_calibration", None) or {})
+            if not calib:
+                calib = self._load_board_view_calibration() or {}
+            calib["dz_to_kinematics_sign"] = float(s)
+            calib["dz_to_kinematics_set_at"] = datetime.now().isoformat(timespec="seconds")
+            calib["dz_to_kinematics_set_by"] = str(set_by)
+            self.board_view_calibration = calib
+            self._save_board_view_calibration(calib)
+            self._append_exec_log(
+                "info",
+                f"Saved dz_to_kinematics_sign={s:+.0f} (semantic +dz=up maps to kinematics Δz={s:+.0f}·dz)",
+            )
+        except Exception:
+            pass
+
     # NOTE: We intentionally do NOT use OpenCV chessboard detectors for localization.
     # Detection and reasoning are performed via LLM vision to be robust to non-standard boards,
     # lighting, and partial views.
@@ -2047,6 +2083,23 @@ class ChessRobotUILLM(QMainWindow):
         """)
         QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self.open_position_calibration)
         control_layout.addWidget(positions_btn)
+
+        # LLM Tools test panel button (manual tool calls)
+        tools_btn = QPushButton("TOOLS")
+        tools_btn.setToolTip("Open LLM tool call test panel (Ctrl+K)")
+        tools_btn.clicked.connect(self.open_tool_test_panel)
+        tools_btn.setStyleSheet("""
+            QPushButton {
+                background: #0ea5e9;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #38bdf8;
+            }
+        """)
+        QShortcut(QKeySequence("Ctrl+K"), self).activated.connect(self.open_tool_test_panel)
+        control_layout.addWidget(tools_btn)
 
         # Workspace estimate button
         workspace_btn = QPushButton("WORKSPACE")
@@ -3019,7 +3072,14 @@ class ChessRobotUILLM(QMainWindow):
             {
                 "type": "function",
                 "name": "move_gripper_delta",
-                "description": "Move the end-effector by a small delta in the robot BASE frame (mm). +dx=forward/away from base, +dy=right (same direction as increasing shoulder_pan), +dz=up. Use small deltas (5-25mm).",
+                "description": (
+                    "Move the end-effector by a small delta (mm) using a STABLE cylindrical interpretation:\n"
+                    "- dx_mm = radial (forward/back): +dx moves FARTHER from the base (increases distance r)\n"
+                    "- dy_mm = tangential (left/right around base): +dy moves around the base (changes angle theta)\n"
+                    "- dz_mm = vertical: +dz moves UP (height)\n"
+                    "This is designed so 'move forward' keeps height constant (dz=0) and produces coordinated joint motion.\n"
+                    "Use small deltas (5–25mm)."
+                ),
                 "strict": False,
                 "parameters": {
                     "type": "object",
@@ -3067,28 +3127,82 @@ class ChessRobotUILLM(QMainWindow):
         """Execute a single tool call requested by the LLM."""
         try:
             if name == "move_gripper_delta":
-                dx = float(args.get("dx_mm", 0.0))
-                dy = float(args.get("dy_mm", 0.0))
-                dz = float(args.get("dz_mm", 0.0))
+                # Interpret dx/dy as radial/tangential (cylindrical) deltas in the XY plane at constant Z
+                # to match the mental model of "move forward" meaning farther from base.
+                dr = float(args.get("dx_mm", 0.0))
+                dt = float(args.get("dy_mm", 0.0))
+                dz = float(args.get("dz_mm", 0.0))  # semantic: +dz = up
 
-                # Conservative clamp before calling motion (motion has its own clamps too).
-                dx = float(np.clip(dx, -40.0, 40.0))
-                dy = float(np.clip(dy, -40.0, 40.0))
+                # Clamp requested deltas
+                dr = float(np.clip(dr, -40.0, 40.0))
+                dt = float(np.clip(dt, -40.0, 40.0))
                 dz = float(np.clip(dz, -12.0, 40.0))
 
-                self._append_exec_log("info", f"TOOL move_gripper_delta(dx={dx:+.1f}, dy={dy:+.1f}, dz={dz:+.1f})")
+                # Current EE position (mm)
+                self.update_position_model()
+                ee0 = self.position_model.get("end_effector", (0.0, 0.0, 0.0))
+                x0, y0, z0 = float(ee0[0]), float(ee0[1]), float(ee0[2])
+                r = float(np.hypot(x0, y0))
+
+                # Convert cylindrical deltas -> base-frame dx/dy (mm)
+                if r > 1e-3:
+                    rx, ry = x0 / r, y0 / r
+                    tx, ty = -y0 / r, x0 / r
+                    dx = dr * rx + dt * tx
+                    dy = dr * ry + dt * ty
+                else:
+                    # Near origin, fall back to raw base-frame deltas
+                    dx = dr
+                    dy = dt
+
+                dz_sign = float(self._get_dz_to_kinematics_sign())
+                dz_kinematics = float(dz) * float(dz_sign)
+
+                self._append_exec_log(
+                    "info",
+                    f"TOOL move_gripper_delta(dr={dr:+.1f}, dt={dt:+.1f}, dz={dz:+.1f}) -> base Δx={dx:+.1f}, Δy={dy:+.1f}, Δz(semantic)={dz:+.1f} (kinematics Δz={dz_kinematics:+.1f})",
+                )
+
+                # Execute motion
                 ok = bool(self._move_gripper_mm(dx, dy, dz, apply_ui_step=False))
                 self.update_position_model()
-                ee = self.position_model.get("end_effector", None)
-                return {"ok": ok, "dx_mm": dx, "dy_mm": dy, "dz_mm": dz, "end_effector_mm": ee}
+                ee1 = self.position_model.get("end_effector", None)
+
+                # Verification: how much did we drift in Z and what EE delta actually happened?
+                drift = {}
+                try:
+                    if isinstance(ee1, (list, tuple)) and len(ee1) == 3:
+                        x1, y1, z1 = float(ee1[0]), float(ee1[1]), float(ee1[2])
+                        kin_dz = z1 - z0
+                        sem_dz = float(kin_dz) / float(dz_sign) if abs(float(dz_sign)) > 1e-9 else float(kin_dz)
+                        drift = {
+                            "ee_before_mm": {"x": x0, "y": y0, "z": z0},
+                            "ee_after_mm": {"x": x1, "y": y1, "z": z1},
+                            "ee_delta_mm": {"dx": x1 - x0, "dy": y1 - y0, "dz": z1 - z0},
+                            "z_drift_mm": kin_dz,
+                            "semantic_z_drift_mm": sem_dz,
+                            "dz_to_kinematics_sign": float(dz_sign),
+                        }
+                        if abs(kin_dz) > 3.0 and abs(dz) < 1e-6:
+                            self._append_exec_log("warning", f"Z drift during 'flat' move: kinematics Δz={kin_dz:+.1f}mm (expected ~0)")
+                except Exception:
+                    drift = {}
+                return {
+                    "ok": ok,
+                    "requested": {"dr_mm": dr, "dt_mm": dt, "dz_mm": dz},
+                    "executed_base": {"dx_mm": float(dx), "dy_mm": float(dy), "dz_mm": float(dz_kinematics)},
+                    "axis_mapping": {"dz_to_kinematics_sign": float(dz_sign)},
+                    "end_effector_mm": ee1,
+                    "verification": drift,
+                }
 
             if name == "set_gripper_percent":
                 pct = float(args.get("percent", 0.0))
                 pct = float(np.clip(pct, 0.0, 100.0))
                 self._append_exec_log("info", f"TOOL set_gripper_percent({pct:.1f})")
-                self._set_gripper(pct)
+                ok = bool(self._set_gripper(pct))
                 self.update_position_model()
-                return {"ok": True, "percent": pct, "gripper_percent": float(self.position_model.get('gripper', pct))}
+                return {"ok": ok, "percent": pct, "gripper_percent": float(self.position_model.get('gripper', pct))}
 
             if name == "finish_grasp":
                 success = bool(args.get("success", False))
@@ -3536,8 +3650,9 @@ YOUR JOB:
   3) finish_grasp(success, message)
 
 MOVE AXES (robot BASE frame):
-- +dx_mm = forward / farther from base
-- +dy_mm = right (same direction as increasing shoulder_pan)
+- For move_gripper_delta, interpret deltas cylindrically for stability:
+  - +dx_mm = forward / farther from base (radial out, increases r)
+  - +dy_mm = sweep around base (tangential; small left/right around the base centerline)
 - +dz_mm = up
 
 RULES:
@@ -4973,18 +5088,29 @@ Guidelines:
                 step_size = float(self.step_size_combo.currentText())
                 dx = float(dx_mm) * step_size / 10.0
                 dy = float(dy_mm) * step_size / 10.0
-                dz = float(dz_mm) * step_size / 10.0
+                dz_semantic = float(dz_mm) * step_size / 10.0
             else:
                 dx = float(dx_mm)
                 dy = float(dy_mm)
-                dz = float(dz_mm)
+                dz_semantic = float(dz_mm)
 
             # Safety: avoid "slamming" downward into the board/table.
             max_down_mm = 8.0
-            if dz < -max_down_mm:
-                dz = -max_down_mm
+            if dz_semantic < -max_down_mm:
+                dz_semantic = -max_down_mm
+
+            # Map semantic dz (+up) into the kinematics Z axis (some URDFs have inverted Z).
+            dz_sign = float(self._get_dz_to_kinematics_sign())
+            dz = float(dz_semantic) * float(dz_sign)
+
+            # No-op guard: avoid calling IK/commanding motors for ~zero deltas (prevents tiny drift).
+            if abs(dx) < 1e-6 and abs(dy) < 1e-6 and abs(dz_semantic) < 1e-6:
+                return True
             
-            self.status_bar.setText(f"🎯 Moving gripper: Δx={dx:.1f}, Δy={dy:.1f}, Δz={dz:.1f} mm")
+            self.status_bar.setText(
+                f"🎯 Moving gripper: Δx={dx:.1f}, Δy={dy:.1f}, Δz={dz_semantic:.1f} mm"
+                + ("" if dz_sign >= 0 else " (Z inverted)")
+            )
             
             # Get current joint positions
             current_joints = {}
@@ -5076,26 +5202,79 @@ Guidelines:
                             self.status_bar.setText("❌ Target outside workspace bounds!")
                             return False
 
-                    # Solve IK
-                    target_joints = self.kinematics.inverse_kinematics(
-                        current_joint_array, T_target, position_weight=1.0, orientation_weight=0.02
-                    )
+                    # ─────────────────────────────────────────────────────────────────────────
+                    # IK STEP (position-only) with TASK-SPACE scaling
+                    # ─────────────────────────────────────────────────────────────────────────
+                    # The earlier Jacobian / joint-space scaling approaches caused unintended axis coupling.
+                    # Here we always solve IK for a *task-space* step toward the desired translated pose.
+                    # If the resulting joint deltas are too large, we reduce the task-space step and retry.
 
-                    # Clamp per-joint change (deg) and move all joints together
-                    max_joint_step_deg = 8.0
-                    motor_positions = {}
-                    for i, motor_name in enumerate(joint_names):
-                        cur = float(current_joints[motor_name])
-                        tgt = float(target_joints[i]) if i < len(target_joints) else cur
-                        delta = tgt - cur
-                        if abs(delta) > max_joint_step_deg:
-                            tgt = cur + max_joint_step_deg * (1.0 if delta > 0 else -1.0)
-                        motor_positions[motor_name] = tgt
+                    cur_vec_deg = np.array([float(current_joints[name]) for name in joint_names], dtype=float)
+                    p0_m = np.array(T_current[:3, 3], dtype=float)
 
+                    # Desired task-space delta in mm (already per-axis clamped earlier)
+                    dp_mm = np.array([dx, dy, dz], dtype=float)
+
+                    # Extra safety: clamp overall step length so the local IK stays well-behaved.
+                    max_task_step_mm = 20.0
+                    dp_norm = float(np.linalg.norm(dp_mm))
+                    if dp_norm > max_task_step_mm and dp_norm > 1e-6:
+                        scale0 = max_task_step_mm / dp_norm
+                        dp_mm = dp_mm * float(scale0)
+                        self._append_exec_log("debug", f"Clamped task step to {max_task_step_mm:.0f}mm (scale={scale0:.2f})")
+
+                    # Solve IK for the (possibly scaled) target pose, shrinking further if joint deltas are too large.
+                    max_joint_step_deg = 6.0
+                    scale = 1.0
+                    step_vec = None
+                    for attempt in range(4):
+                        p_step_m = p0_m + (scale * dp_mm) / 1000.0
+                        T_step = np.array(T_current, copy=True)
+                        T_step[:3, 3] = p_step_m
+
+                        tgt = self.kinematics.inverse_kinematics(
+                            cur_vec_deg.tolist(), T_step, position_weight=1.0, orientation_weight=0.0
+                        )
+                        tgt_vec = np.array([float(tgt[i]) for i in range(len(joint_names))], dtype=float)
+
+                        # Lock wrist_roll to current (it doesn't affect XYZ; prevents camera roll drift)
+                        try:
+                            idx_roll = joint_names.index("wrist_roll")
+                            tgt_vec[idx_roll] = cur_vec_deg[idx_roll]
+                        except Exception:
+                            pass
+
+                        # Clamp to known joint limits if we have them
+                        jl = (getattr(self, "workspace_estimate", None) or {}).get("joint_limits_deg") or {}
+                        for i, jn in enumerate(joint_names):
+                            if jn in jl:
+                                lo = float(jl[jn].get("min", -180.0))
+                                hi = float(jl[jn].get("max", 180.0))
+                                tgt_vec[i] = float(np.clip(tgt_vec[i], lo, hi))
+
+                        delta_j = tgt_vec - cur_vec_deg
+                        max_abs = float(np.max(np.abs(delta_j))) if delta_j.size else 0.0
+                        step_vec = tgt_vec
+
+                        if max_abs <= max_joint_step_deg or attempt == 3:
+                            break
+
+                        # Reduce the task-space step and retry
+                        shrink = (max_joint_step_deg / max_abs) * 0.92
+                        scale = float(scale) * float(max(shrink, 0.15))
+                        self._append_exec_log("debug", f"IK step too large (max Δjoint={max_abs:.1f}°); shrinking task step to scale={scale:.2f}")
+
+                    if step_vec is None:
+                        self._append_exec_log("error", "IK failed to produce a step_vec")
+                        return False
+
+                    motor_positions = {name: float(step_vec[i]) for i, name in enumerate(joint_names)}
                     self.bus.sync_write("Goal_Position", motor_positions, normalize=True)
                     time.sleep(0.4)
 
-                    self.status_bar.setText(f"✅ Moved toward ({target_x:.1f}, {target_y:.1f}, {target_z:.1f})")
+                    # Report the actual step target for transparency
+                    p_goal_mm = (p0_m * 1000.0) + (scale * dp_mm)
+                    self.status_bar.setText(f"✅ IK step toward ({p_goal_mm[0]:.1f}, {p_goal_mm[1]:.1f}, {p_goal_mm[2]:.1f})")
                     return True
                     
                 except Exception as e:
@@ -5720,6 +5899,23 @@ Guidelines:
             # Resume monitoring after dialog closes
             if hasattr(self, 'monitor_thread') and self.monitor_thread:
                 self.monitor_thread.paused = False
+
+    def open_tool_test_panel(self):
+        """Open a dialog to manually execute the same tool calls available to the LLM grasp loop."""
+        if not hasattr(self, "bus") or not getattr(self.bus, "is_connected", False):
+            self.status_bar.setText("❌ Robot not connected")
+            return
+
+        # Pause monitoring during tool testing to avoid serial conflicts
+        if hasattr(self, "monitor_thread") and self.monitor_thread:
+            self.monitor_thread.paused = True
+
+        try:
+            dialog = ToolTestDialog(self)
+            dialog.exec()
+        finally:
+            if hasattr(self, "monitor_thread") and self.monitor_thread:
+                self.monitor_thread.paused = False
     
     def refresh_status(self):
         """Force refresh of all displays."""
@@ -6243,6 +6439,282 @@ class ManualMotorControlDialog(QDialog):
             QMessageBox.information(self, "Saved", f"Saved M5 pick roll (wrist_roll_pick_deg) = {deg:+.1f}°")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to save M5 pick roll: {e}")
+
+
+class ToolTestDialog(QDialog):
+    """Dialog to manually execute the same function tools the LLM can call (move/gripper)."""
+
+    def __init__(self, parent_window: "ChessRobotUILLM"):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+        self.bus = getattr(parent_window, "bus", None)
+        self.setWindowTitle("LLM Tool Test Panel")
+        self.setMinimumSize(820, 620)
+        self.setStyleSheet("""
+            QDialog {
+                background: #0d1117;
+                color: #c9d1d9;
+            }
+            QLabel { color: #c9d1d9; }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                margin-top: 12px;
+                padding-top: 10px;
+                background: #161b22;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+            QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+                background: #0d1117;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+                padding: 6px 8px;
+            }
+            QPushButton {
+                background: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 8px 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #30363d; border-color: #8b949e; }
+        """)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh_state)
+        self._timer.start(250)
+
+        self._build_ui()
+        self._refresh_state()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel("🧪 LLM Tool Test Panel")
+        title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #58a6ff;")
+        layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Manually execute the same tool calls used by the LLM grasp loop. "
+            "This is the safest way to debug move/forward behavior and gripper open/close."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #8b949e;")
+        layout.addWidget(subtitle)
+
+        state_group = QGroupBox("Current Robot State (live)")
+        state_layout = QGridLayout(state_group)
+        state_layout.setHorizontalSpacing(10)
+        state_layout.setVerticalSpacing(6)
+
+        self.ee_label = QLabel("EE: --")
+        self.gripper_label = QLabel("Gripper: --")
+        self.roll_label = QLabel("Wrist roll neutral: --")
+        self.zmap_label = QLabel("Z mapping: --")
+        self.note_label = QLabel("Note: move_gripper_delta uses radial/tangential deltas (dx=radial, dy=tangent).")
+        self.note_label.setStyleSheet("color: #8b949e;")
+        self.note_label.setWordWrap(True)
+
+        state_layout.addWidget(self.ee_label, 0, 0, 1, 2)
+        state_layout.addWidget(self.gripper_label, 1, 0, 1, 2)
+        state_layout.addWidget(self.roll_label, 2, 0, 1, 2)
+        state_layout.addWidget(self.zmap_label, 3, 0, 1, 2)
+
+        self.invert_z_checkbox = QCheckBox("Invert Z (use this if Up/Down is reversed)")
+        self.invert_z_checkbox.setStyleSheet("color: #c9d1d9;")
+        self.invert_z_checkbox.setChecked(bool(self.parent_window._get_dz_to_kinematics_sign() < 0))
+        self.invert_z_checkbox.stateChanged.connect(self._on_invert_z_changed)
+        state_layout.addWidget(self.invert_z_checkbox, 4, 0, 1, 2)
+
+        state_layout.addWidget(self.note_label, 5, 0, 1, 2)
+        layout.addWidget(state_group)
+
+        tool_group = QGroupBox("Tool Call")
+        tool_layout = QGridLayout(tool_group)
+        tool_layout.setHorizontalSpacing(10)
+        tool_layout.setVerticalSpacing(8)
+
+        self.tool_combo = QComboBox()
+        self.tool_combo.addItems(["move_gripper_delta", "set_gripper_percent", "finish_grasp"])
+        self.tool_combo.currentTextChanged.connect(self._update_tool_fields)
+
+        tool_layout.addWidget(QLabel("Tool:"), 0, 0)
+        tool_layout.addWidget(self.tool_combo, 0, 1)
+
+        # Fields (stacked)
+        self.fields_stack = QWidget()
+        self.fields_layout = QVBoxLayout(self.fields_stack)
+        self.fields_layout.setContentsMargins(0, 0, 0, 0)
+        self.fields_layout.setSpacing(10)
+        tool_layout.addWidget(self.fields_stack, 1, 0, 1, 2)
+
+        # move_gripper_delta fields
+        self.move_fields = QWidget()
+        mf = QGridLayout(self.move_fields)
+        mf.setHorizontalSpacing(10)
+        mf.setVerticalSpacing(6)
+
+        self.dx_spin = QDoubleSpinBox()
+        self.dx_spin.setRange(-80.0, 80.0)
+        self.dx_spin.setDecimals(1)
+        self.dx_spin.setSingleStep(1.0)
+        self.dx_spin.setValue(10.0)
+
+        self.dy_spin = QDoubleSpinBox()
+        self.dy_spin.setRange(-80.0, 80.0)
+        self.dy_spin.setDecimals(1)
+        self.dy_spin.setSingleStep(1.0)
+        self.dy_spin.setValue(0.0)
+
+        self.dz_spin = QDoubleSpinBox()
+        self.dz_spin.setRange(-40.0, 80.0)
+        self.dz_spin.setDecimals(1)
+        self.dz_spin.setSingleStep(1.0)
+        self.dz_spin.setValue(0.0)
+
+        mf.addWidget(QLabel("dx_mm (radial forward + / back -):"), 0, 0)
+        mf.addWidget(self.dx_spin, 0, 1)
+        mf.addWidget(QLabel("dy_mm (tangential sweep + / -):"), 1, 0)
+        mf.addWidget(self.dy_spin, 1, 1)
+        mf.addWidget(QLabel("dz_mm (up + / down -):"), 2, 0)
+        mf.addWidget(self.dz_spin, 2, 1)
+
+        hint = QLabel("Tip: set dz_mm=0 to keep height constant while moving forward/back.")
+        hint.setStyleSheet("color: #8b949e;")
+        hint.setWordWrap(True)
+        mf.addWidget(hint, 3, 0, 1, 2)
+
+        # set_gripper_percent fields
+        self.grip_fields = QWidget()
+        gf = QGridLayout(self.grip_fields)
+        gf.setHorizontalSpacing(10)
+        gf.setVerticalSpacing(6)
+
+        self.grip_spin = QDoubleSpinBox()
+        self.grip_spin.setRange(0.0, 100.0)
+        self.grip_spin.setDecimals(1)
+        self.grip_spin.setSingleStep(1.0)
+        self.grip_spin.setValue(15.0)
+        gf.addWidget(QLabel("percent (0=open, 100=closed):"), 0, 0)
+        gf.addWidget(self.grip_spin, 0, 1)
+
+        # finish_grasp fields
+        self.finish_fields = QWidget()
+        ff = QGridLayout(self.finish_fields)
+        ff.setHorizontalSpacing(10)
+        ff.setVerticalSpacing(6)
+
+        self.finish_success = QComboBox()
+        self.finish_success.addItems(["false", "true"])
+        self.finish_msg = QLineEdit()
+        self.finish_msg.setPlaceholderText("message")
+        ff.addWidget(QLabel("success:"), 0, 0)
+        ff.addWidget(self.finish_success, 0, 1)
+        ff.addWidget(QLabel("message:"), 1, 0)
+        ff.addWidget(self.finish_msg, 1, 1)
+
+        # Add all, then select
+        self.fields_layout.addWidget(self.move_fields)
+        self.fields_layout.addWidget(self.grip_fields)
+        self.fields_layout.addWidget(self.finish_fields)
+
+        # Buttons + output (create exec_btn BEFORE _update_tool_fields which references it)
+        btn_row = QHBoxLayout()
+        self.exec_btn = QPushButton("▶ EXECUTE TOOL")
+        self.exec_btn.setStyleSheet("QPushButton { background: #238636; color: white; } QPushButton:hover { background: #2ea043; }")
+        self.exec_btn.clicked.connect(self._execute_selected_tool)
+        btn_row.addWidget(self.exec_btn)
+
+        self.close_btn = QPushButton("✖ CLOSE")
+        self.close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self.close_btn)
+        btn_row.addStretch()
+        tool_layout.addLayout(btn_row, 2, 0, 1, 2)
+
+        self.output = QTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setMinimumHeight(180)
+        self.output.setStyleSheet("font-family: 'Monaco','Menlo','Consolas', monospace; font-size: 10pt;")
+        tool_layout.addWidget(QLabel("Result / Debug:"), 3, 0)
+        tool_layout.addWidget(self.output, 4, 0, 1, 2)
+
+        layout.addWidget(tool_group, 1)
+
+        # Now that exec_btn exists, update visibility for the initial tool selection
+        self._update_tool_fields(self.tool_combo.currentText())
+
+    def _update_tool_fields(self, tool_name: str):
+        self.move_fields.setVisible(tool_name == "move_gripper_delta")
+        self.grip_fields.setVisible(tool_name == "set_gripper_percent")
+        self.finish_fields.setVisible(tool_name == "finish_grasp")
+
+        # Disable move tool if IK/robot not available
+        if tool_name == "move_gripper_delta":
+            if getattr(self.parent_window, "kinematics", None) is None:
+                self.exec_btn.setEnabled(False)
+                self.exec_btn.setToolTip("Kinematics not available; can't execute move_gripper_delta safely.")
+            else:
+                self.exec_btn.setEnabled(True)
+                self.exec_btn.setToolTip("")
+        else:
+            self.exec_btn.setEnabled(True)
+
+    def _refresh_state(self):
+        try:
+            self.parent_window.update_position_model()
+            ee = self.parent_window.position_model.get("end_effector", None)
+            if ee and isinstance(ee, (list, tuple)) and len(ee) == 3:
+                self.ee_label.setText(f"EE (mm): x={float(ee[0]):+.1f}, y={float(ee[1]):+.1f}, z={float(ee[2]):+.1f}")
+            else:
+                self.ee_label.setText("EE (mm): --")
+            g = float(self.parent_window.position_model.get("gripper", 0.0))
+            self.gripper_label.setText(f"Gripper (%): {g:.1f} (0=open, 100=closed)")
+            nr = float(self.parent_window._get_wrist_roll_neutral_deg())
+            self.roll_label.setText(f"Wrist roll neutral: {nr:+.1f}° (parallel to ground)")
+            dz_sign = float(self.parent_window._get_dz_to_kinematics_sign())
+            self.zmap_label.setText(f"Z mapping: dz_to_kinematics_sign={dz_sign:+.0f}  (semantic +dz=up)")
+            try:
+                self.invert_z_checkbox.blockSignals(True)
+                self.invert_z_checkbox.setChecked(bool(dz_sign < 0))
+            finally:
+                self.invert_z_checkbox.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_invert_z_changed(self, state: int):
+        try:
+            sign = -1.0 if int(state) != 0 else 1.0
+            self.parent_window._set_dz_to_kinematics_sign(sign, set_by="tool_test")
+            self._refresh_state()
+        except Exception:
+            pass
+
+    def _execute_selected_tool(self):
+        tool = str(self.tool_combo.currentText())
+        args: Dict[str, Any] = {}
+
+        try:
+            if tool == "move_gripper_delta":
+                args = {"dx_mm": float(self.dx_spin.value()), "dy_mm": float(self.dy_spin.value()), "dz_mm": float(self.dz_spin.value())}
+            elif tool == "set_gripper_percent":
+                args = {"percent": float(self.grip_spin.value())}
+            elif tool == "finish_grasp":
+                args = {"success": (self.finish_success.currentText().lower() == "true"), "message": str(self.finish_msg.text())}
+
+            result = self.parent_window._execute_grasp_tool_call(tool, args)
+            self.output.append(f"> {tool}({args})")
+            self.output.append(json.dumps(result, indent=2))
+            self.output.append("")
+            # Also update state immediately
+            self._refresh_state()
+        except Exception as e:
+            self.output.append(f"ERROR executing {tool}: {e}")
+            self.output.append("")
     
     def create_motor_control(self, motor_name: str, config: dict) -> QGroupBox:
         """Create control group for a single motor."""
