@@ -1055,6 +1055,52 @@ class ChessRobotUILLM(QMainWindow):
         except Exception:
             pass
 
+    def _get_wrist_roll_neutral_deg(self) -> float:
+        """Return the calibrated 'neutral' wrist_roll (m5) angle in degrees.
+
+        Neutral is defined physically as the gripper being oriented **parallel to the ground**
+        (i.e., not sideways). If not configured, falls back to 0°.
+        """
+        try:
+            bvc = getattr(self, "board_view_calibration", None) or {}
+            if not bvc:
+                bvc = self._load_board_view_calibration() or {}
+            val = bvc.get("wrist_roll_neutral_deg", None)
+            if val is None:
+                # Fallback: if a pick roll exists, it's often the same as neutral.
+                val = bvc.get("wrist_roll_pick_deg", None)
+            return float(val) if val is not None else 0.0
+        except Exception:
+            return 0.0
+
+    def _set_wrist_roll_neutral_deg(self, neutral_deg: float, set_by: str = "manual") -> None:
+        """Persist a new wrist_roll neutral angle into board_view_calibration.json."""
+        try:
+            calib = dict(getattr(self, "board_view_calibration", None) or {})
+            if not calib:
+                calib = self._load_board_view_calibration() or {}
+            calib["wrist_roll_neutral_deg"] = float(neutral_deg)
+            calib["wrist_roll_neutral_set_at"] = datetime.now().isoformat(timespec="seconds")
+            calib["wrist_roll_neutral_set_by"] = str(set_by)
+            self.board_view_calibration = calib
+            self._save_board_view_calibration(calib)
+        except Exception:
+            pass
+
+    def _set_wrist_roll_pick_deg(self, pick_deg: float, set_by: str = "manual") -> None:
+        """Persist a new wrist_roll 'pick' angle into board_view_calibration.json."""
+        try:
+            calib = dict(getattr(self, "board_view_calibration", None) or {})
+            if not calib:
+                calib = self._load_board_view_calibration() or {}
+            calib["wrist_roll_pick_deg"] = float(pick_deg)
+            calib["wrist_roll_pick_set_at"] = datetime.now().isoformat(timespec="seconds")
+            calib["wrist_roll_pick_set_by"] = str(set_by)
+            self.board_view_calibration = calib
+            self._save_board_view_calibration(calib)
+        except Exception:
+            pass
+
     # NOTE: We intentionally do NOT use OpenCV chessboard detectors for localization.
     # Detection and reasoning are performed via LLM vision to be robust to non-standard boards,
     # lighting, and partial views.
@@ -1238,7 +1284,7 @@ class ChessRobotUILLM(QMainWindow):
             )
         
         self.bus = FeetechMotorsBus(port=self.port, motors=self.all_motors, calibration=calibration)
-    
+        
     def configure_motors_gentle(self):
         """Configure motors 3 (elbow_flex), 4 (wrist_flex), and 6 (gripper) with gentler settings to reduce stiffness.
         
@@ -2115,6 +2161,24 @@ class ChessRobotUILLM(QMainWindow):
             pan = float(cur.get("shoulder_pan", 0.0))
             roll = float(cur.get("wrist_roll", 0.0))
 
+            # If the user has calibrated a neutral wrist_roll (parallel to ground),
+            # move there first so the camera isn't sideways during localization.
+            try:
+                bvc_existing = getattr(self, "board_view_calibration", None) or {}
+                if "wrist_roll_neutral_deg" in bvc_existing:
+                    neutral_roll = self._get_wrist_roll_neutral_deg()
+                    if abs(float(roll) - float(neutral_roll)) > 2.0:
+                        safe = self._validate_llm_action({"wrist_roll.pos": float(neutral_roll)}, cur)
+                        if safe:
+                            self._execute_llm_action(safe)
+                            time.sleep(0.4)
+                            self.update_position_model()
+                            cur = dict(self.position_model.get("joints", {}))
+                            roll = float(cur.get("wrist_roll", neutral_roll))
+                            self._append_exec_log("info", f"Localize: set wrist_roll to neutral {neutral_roll:+.1f}° (parallel to ground)")
+            except Exception:
+                pass
+
             # Pan limits from workspace estimate if available
             pan_lo, pan_hi = -90.0, 90.0
             try:
@@ -2215,16 +2279,20 @@ class ChessRobotUILLM(QMainWindow):
             except Exception:
                 pass
 
-            # Save calibration
-            calib = {
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "pan_center_deg": float(pan_center),
-                "pan_limits_deg": {"min": float(pan_lo), "max": float(pan_hi)},
-                "wrist_roll_at_calibration_deg": float(roll),
-                "board_center_norm": best.get("center_norm"),
-                "board_angle_deg": best.get("angle_deg", None),
-                "note": "pan_center_deg is the shoulder_pan angle that best centers the detected board in the image.",
-            }
+            # Save calibration (MERGE into existing board_view_calibration so we don't clobber
+            # wrist_roll_neutral_deg / wrist_roll_pick_deg / pick targets, etc.)
+            calib = dict(getattr(self, "board_view_calibration", None) or {})
+            calib.update(
+                {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "pan_center_deg": float(pan_center),
+                    "pan_limits_deg": {"min": float(pan_lo), "max": float(pan_hi)},
+                    "wrist_roll_at_calibration_deg": float(roll),
+                    "board_center_norm": best.get("center_norm"),
+                    "board_angle_deg": best.get("angle_deg", None),
+                    "note": "pan_center_deg is the shoulder_pan angle that best centers the detected board in the image.",
+                }
+            )
             self.board_view_calibration = calib
             self._save_board_view_calibration(calib)
 
@@ -2234,7 +2302,10 @@ class ChessRobotUILLM(QMainWindow):
             cur_pan = float(cur.get("shoulder_pan", 0.0))
             pan_err = cur_pan - float(pan_center)
             self._append_exec_log("info", f"✅ Localize saved: pan_center={pan_center:+.1f}°. Current m1 error={pan_err:+.1f}° (shoulder_pan - pan_center).")
-            self._append_exec_log("info", f"Tip: keep wrist_roll near 0° while scanning; current roll={float(cur.get('wrist_roll', 0.0)):+.1f}°")
+            self._append_exec_log(
+                "info",
+                f"Tip: keep wrist_roll near neutral {self._get_wrist_roll_neutral_deg():+.1f}° while scanning (parallel to ground); current roll={float(cur.get('wrist_roll', 0.0)):+.1f}°",
+            )
         finally:
             if hasattr(self, "monitor_thread") and self.monitor_thread:
                 self.monitor_thread.paused = was_paused
@@ -2710,7 +2781,7 @@ class ChessRobotUILLM(QMainWindow):
             self.exec_log_reset_signal.connect(self._on_exec_log_reset)
             self.execution_ui_mode_signal.connect(self._on_execution_ui_mode)
             self._exec_log_signals_connected = True
-
+        
         # Response sections with scroll areas
         # Reasoning
         llm_layout.addWidget(QLabel("Reasoning:"))
@@ -2802,6 +2873,233 @@ class ChessRobotUILLM(QMainWindow):
             return ""
         return "\n".join(list(self._exec_log_lines)[-self._exec_log_prompt_max_lines :])
 
+    def _parse_llm_api_error(self, exception: Exception) -> str:
+        """Best-effort parsing of OpenAI SDK errors into a short, user-facing message."""
+        try:
+            # openai-python exceptions typically stringify with: "Error code: XXX - {...}"
+            msg = str(exception)
+            return msg
+        except Exception:
+            return "Unknown LLM error"
+
+    def _call_llm(
+        self,
+        instructions: str,
+        prompt: str,
+        images: Optional[List[str]] = None,
+        max_tokens: int = 500,
+        json_output: bool = False,
+        temperature: Optional[float] = None,
+        detail: str = "high"
+    ) -> Optional[str]:
+        """Call OpenAI's Responses API (the new recommended API).
+        
+        Args:
+            instructions: System-level instructions for the model
+            prompt: The user prompt/question
+            images: Optional list of base64-encoded images
+            max_tokens: Maximum output tokens (default 500)
+            json_output: If True, request JSON output format
+            temperature: Optional temperature override (ignored for reasoning models)
+            detail: Image detail level ("low", "high", or "auto")
+        
+        Returns:
+            The model's response text, or None on error
+        """
+        try:
+            if not self.llm_enabled or not self.llm_client:
+                return None
+            
+            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
+            
+            # Build input content
+            content = []
+            
+            # Add text prompt - must include "json" if requesting json_object format
+            text_prompt = prompt
+            if json_output and "json" not in prompt.lower():
+                text_prompt = prompt + "\n\nRespond in JSON format."
+            content.append({"type": "input_text", "text": text_prompt})
+            
+            # Add images if provided
+            if images:
+                for img_b64 in images:
+                    if img_b64:
+                        content.append({
+                            "type": "input_image",
+                            "image_url": f"data:image/jpeg;base64,{img_b64}",
+                            "detail": detail
+                        })
+            
+            # Build input as list of messages
+            input_data = [{"role": "user", "content": content}]
+            
+            # Build API params for Responses API
+            api_params = {
+                "model": selected_model,
+                "instructions": instructions,
+                "input": input_data,
+                "max_output_tokens": max_tokens
+            }
+            
+            # Add JSON format if requested
+            if json_output:
+                api_params["text"] = {"format": {"type": "json_object"}}
+            
+            # Add temperature for non-reasoning models
+            is_reasoning_model = selected_model.startswith("o")
+            if temperature is not None and not is_reasoning_model:
+                api_params["temperature"] = temperature
+            
+            # Call the Responses API
+            response = self.llm_client.responses.create(**api_params)
+            
+            # Return the output text
+            return response.output_text
+            
+        except Exception as e:
+            error_msg = self._parse_llm_api_error(e)
+            print(f"⚠️ LLM call failed: {error_msg}")
+            return None
+
+    def _call_llm_response(
+        self,
+        *,
+        instructions: Optional[str] = None,
+        input_items: Any = None,
+        max_output_tokens: int = 500,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: str = "auto",
+        parallel_tool_calls: bool = False,
+        max_tool_calls: Optional[int] = 1,
+        previous_response_id: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ):
+        """Lower-level Responses API call that returns the full Response object (needed for tool calling)."""
+        try:
+            if not self.llm_enabled or not self.llm_client:
+                return None
+
+            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
+            api_params: Dict[str, Any] = {
+                "model": selected_model,
+                "max_output_tokens": int(max_output_tokens),
+                "tool_choice": tool_choice,
+                "parallel_tool_calls": bool(parallel_tool_calls),
+            }
+
+            if previous_response_id:
+                api_params["previous_response_id"] = str(previous_response_id)
+
+            if instructions is not None and not previous_response_id:
+                # Typically only needed on the first call of a tool-calling loop.
+                api_params["instructions"] = str(instructions)
+
+            if input_items is not None:
+                api_params["input"] = input_items
+
+            if tools is not None:
+                api_params["tools"] = tools
+                if max_tool_calls is not None:
+                    api_params["max_tool_calls"] = int(max_tool_calls)
+
+            # Add temperature for non-reasoning models
+            is_reasoning_model = selected_model.startswith("o")
+            if temperature is not None and not is_reasoning_model:
+                api_params["temperature"] = float(temperature)
+
+            return self.llm_client.responses.create(**api_params)
+        except Exception as e:
+            self._append_exec_log("error", f"LLM (responses) call failed: {self._parse_llm_api_error(e)}")
+            return None
+
+    def _grasp_tool_definitions(self) -> List[Dict[str, Any]]:
+        """Function tools the LLM can call for grasping based on gripper camera vision."""
+        return [
+            {
+                "type": "function",
+                "name": "move_gripper_delta",
+                "description": "Move the end-effector by a small delta in the robot BASE frame (mm). +dx=forward/away from base, +dy=right (same direction as increasing shoulder_pan), +dz=up. Use small deltas (5-25mm).",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "dx_mm": {"type": "number"},
+                        "dy_mm": {"type": "number"},
+                        "dz_mm": {"type": "number"},
+                    },
+                    "required": ["dx_mm", "dy_mm", "dz_mm"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "set_gripper_percent",
+                "description": "Set gripper opening: 0=open, 100=closed. For pre-grasp open slightly (10-25). For grasp close firmly (85-100).",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "percent": {"type": "number"},
+                    },
+                    "required": ["percent"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "finish_grasp",
+                "description": "Finish this grasp attempt (success or abort). Call when you believe the pawn is secured and lifted, or when you cannot proceed safely.",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "success": {"type": "boolean"},
+                        "message": {"type": "string"},
+                    },
+                    "required": ["success", "message"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
+
+    def _execute_grasp_tool_call(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a single tool call requested by the LLM."""
+        try:
+            if name == "move_gripper_delta":
+                dx = float(args.get("dx_mm", 0.0))
+                dy = float(args.get("dy_mm", 0.0))
+                dz = float(args.get("dz_mm", 0.0))
+
+                # Conservative clamp before calling motion (motion has its own clamps too).
+                dx = float(np.clip(dx, -40.0, 40.0))
+                dy = float(np.clip(dy, -40.0, 40.0))
+                dz = float(np.clip(dz, -12.0, 40.0))
+
+                self._append_exec_log("info", f"TOOL move_gripper_delta(dx={dx:+.1f}, dy={dy:+.1f}, dz={dz:+.1f})")
+                ok = bool(self._move_gripper_mm(dx, dy, dz, apply_ui_step=False))
+                self.update_position_model()
+                ee = self.position_model.get("end_effector", None)
+                return {"ok": ok, "dx_mm": dx, "dy_mm": dy, "dz_mm": dz, "end_effector_mm": ee}
+
+            if name == "set_gripper_percent":
+                pct = float(args.get("percent", 0.0))
+                pct = float(np.clip(pct, 0.0, 100.0))
+                self._append_exec_log("info", f"TOOL set_gripper_percent({pct:.1f})")
+                self._set_gripper(pct)
+                self.update_position_model()
+                return {"ok": True, "percent": pct, "gripper_percent": float(self.position_model.get('gripper', pct))}
+
+            if name == "finish_grasp":
+                success = bool(args.get("success", False))
+                message = str(args.get("message", "")).strip()
+                self._append_exec_log("info" if success else "warning", f"TOOL finish_grasp(success={success}) {message}")
+                return {"ok": True, "success": success, "message": message}
+
+            return {"ok": False, "error": f"Unknown tool: {name}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def _set_execution_ui_mode(self, active: bool):
         """Make execution logs more prominent during goal-driven runs."""
         self._execution_active = bool(active)
@@ -2858,55 +3156,62 @@ class ChessRobotUILLM(QMainWindow):
             str or list: Base64 encoded image(s)
         """
         try:
-            # Get target resolution
-            resolution = self.vision_size_combo.currentText()
-            if resolution == "Original":
+            # Target resolution (optional)
+            target_size = None
+            try:
+                if hasattr(self, "vision_size_combo") and self.vision_size_combo:
+                    resolution = str(self.vision_size_combo.currentText())
+                    if resolution and resolution != "Original":
+                        w, h = map(int, resolution.split("x"))
+                        target_size = (w, h)
+            except Exception:
                 target_size = None
-            else:
-                # Parse resolution (e.g., "768x768" -> (768, 768))
-                w, h = map(int, resolution.split('x'))
-                target_size = (w, h)
-            
-            # Capture from gripper camera (the only camera now)
-            print(f"📸 Capturing image from gripper camera")
-            
-            if not self.gripper_camera:
-                print(f"   ⚠️ Gripper camera object is None")
+
+            # This app uses the gripper camera only
+            if not getattr(self, "gripper_camera", None):
+                print("   ⚠️ Gripper camera object is None")
                 return None
-            if not self.gripper_camera.is_connected:
-                print(f"   ⚠️ Gripper camera not connected")
+            if not getattr(self.gripper_camera, "is_connected", False):
+                print("   ⚠️ Gripper camera not connected")
                 return None
-            
+
             frame = self.gripper_camera.read()
             if frame is None:
-                print(f"   ⚠️ Gripper camera returned None frame")
+                print("   ⚠️ Gripper camera returned None frame")
                 return None
-            
-            original_shape = frame.shape
-            
-            # Resize if needed
+
+            original_shape = getattr(frame, "shape", None)
+
+            # Resize if requested
             if target_size:
                 frame = cv2.resize(frame, target_size)
-            
-            # Convert BGR to RGB for proper JPEG colors
+
+            # Camera frames are BGR; convert to RGB before JPEG so colors are correct in LLM/UI.
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Encode to JPEG
-            success, buffer = cv2.imencode('.jpg', frame_rgb, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            
+
+            success, buffer = cv2.imencode(".jpg", frame_rgb, [cv2.IMWRITE_JPEG_QUALITY, 90])
             if not success:
-                print(f"   ⚠️ Gripper camera JPEG encoding failed")
+                print("   ⚠️ Gripper camera JPEG encoding failed")
                 return None
-            
-            # Convert to base64
-            img_base64 = base64.b64encode(buffer).decode('utf-8')
-            print(f"   ✅ Gripper camera: captured {original_shape} -> {frame.shape if target_size else 'original'}, {len(img_base64)//1024}KB")
+
+            img_base64 = base64.b64encode(buffer).decode("utf-8")
+            try:
+                print(
+                    f"   ✅ Gripper camera: captured {original_shape} -> {getattr(frame, 'shape', None)}, {len(img_base64)//1024}KB"
+                )
+            except Exception:
+                pass
+
             return img_base64
-            
+
         except Exception as e:
             print(f"⚠️ Failed to capture camera image: {e}")
-            import traceback
-            traceback.print_exc()
+            try:
+                import traceback
+
+                traceback.print_exc()
+            except Exception:
+                pass
             return None
     
     def toggle_vision_auto_update(self, enabled):
@@ -2955,45 +3260,24 @@ class ChessRobotUILLM(QMainWindow):
         # This is a simplified version that just analyzes without robot control
         # The full implementation will be in execute_llm_command
         try:
-            selected_model = self.llm_model_combo.currentText()
-            
-            # Build vision message
-            messages = [
-                {"role": "system", "content": "You are a chess assistant. Analyze the chess board and provide insights."},
-                {"role": "user", "content": [
-                    {"type": "text", "text": prompt}
-                ]}
-            ]
-            
-            # Add image(s)
-            if isinstance(image_data, list):
-                # Multiple images
-                for img in image_data:
-                    if img:
-                        messages[1]["content"].append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{img}"}
-                        })
-            else:
-                # Single image
-                if image_data:
-                    messages[1]["content"].append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}
-                    })
-            
-            # Send to LLM (simplified - just for analysis)
-            # Use max_completion_tokens for o-series models, max_tokens for others
-            is_reasoning_model = selected_model.startswith("o1") or selected_model.startswith("o3") or selected_model.startswith("o4")
-            api_params = {"model": selected_model, "messages": messages}
-            if is_reasoning_model:
-                api_params["max_completion_tokens"] = 500
-            else:
-                api_params["max_tokens"] = 500
-            response = self.llm_client.chat.completions.create(**api_params)
-            
-            analysis = response.choices[0].message.content
-            print(f"🔍 Scene Analysis: {analysis[:200]}...")
+            images = None
+            if image_data:
+                if isinstance(image_data, list):
+                    images = [img for img in image_data if img]
+                else:
+                    images = [image_data]
+
+            analysis = self._call_llm(
+                instructions="You are a chess assistant. Analyze the chess board and provide insights.",
+                prompt=prompt,
+                images=images,
+                max_tokens=500,
+                json_output=False,
+                detail="high",
+            )
+
+            if analysis:
+                print(f"🔍 Scene Analysis: {analysis[:200]}...")
             
         except Exception as e:
             print(f"⚠️ Scene analysis failed: {e}")
@@ -3004,42 +3288,23 @@ class ChessRobotUILLM(QMainWindow):
             if not self.llm_enabled or not self.llm_client:
                 return None
             
-            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
+            # Prepare images list
+            images = None
+            if image_data:
+                if isinstance(image_data, list):
+                    images = [img for img in image_data if img]
+                else:
+                    images = [image_data]
             
-            # Build vision message
-            user_content = [{"type": "text", "text": prompt}]
-            
-            # Add image
-            if isinstance(image_data, list):
-                for img in image_data:
-                    if img:
-                        user_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "low"}  # Low detail for speed
-                        })
-            else:
-                if image_data:
-                    user_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}", "detail": "low"}
-                    })
-            
-            messages = [
-                {"role": "system", "content": "You are analyzing a chess board scene. Provide brief, actionable feedback about what you see."},
-                {"role": "user", "content": user_content}
-            ]
-            
-            # Quick analysis with lower token limit for speed
-            # Use max_completion_tokens for o-series models, max_tokens for others
-            is_reasoning_model = selected_model.startswith("o1") or selected_model.startswith("o3") or selected_model.startswith("o4")
-            api_params = {"model": selected_model, "messages": messages}
-            if is_reasoning_model:
-                api_params["max_completion_tokens"] = 200
-            else:
-                api_params["max_tokens"] = 200
-            response = self.llm_client.chat.completions.create(**api_params)
-            
-            return response.choices[0].message.content
+            # Use the new Responses API helper with low detail for speed
+            return self._call_llm(
+                instructions="You are analyzing a chess board scene. Provide brief, actionable feedback about what you see.",
+                prompt=prompt,
+                images=images,
+                max_tokens=200,
+                json_output=False,
+                detail="low"  # Low detail for speed
+            )
             
         except Exception as e:
             print(f"⚠️ Quick vision analysis failed: {e}")
@@ -3061,8 +3326,6 @@ class ChessRobotUILLM(QMainWindow):
             if not self.llm_enabled or not self.llm_client or not image_b64:
                 return None
 
-            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
-
             prompt = """You are a precise vision locator for a robot gripper camera.
 
 Task: Find a chess piece in view. Prefer a PAWN if you can confidently identify one, but if you are unsure about piece type,
@@ -3083,32 +3346,20 @@ JSON schema:
 }
 """
 
-            user_content = [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}", "detail": "high"}},
-            ]
-            messages = [
-                {"role": "system", "content": "You are a vision locator. Output only valid JSON."},
-                {"role": "user", "content": user_content},
-            ]
-
-            # Model-appropriate parameters (gpt-5 and o-series require max_completion_tokens)
-            is_o_series = selected_model.startswith("o")
-            is_gpt5 = selected_model.startswith("gpt-5")
-            api_params = {"model": selected_model, "messages": messages}
-            if is_o_series or is_gpt5:
-                api_params["max_completion_tokens"] = 300
-            else:
-                api_params["max_tokens"] = 300
-
-            # Structured JSON output where supported (not for o-series)
-            if not is_o_series:
-                api_params["response_format"] = {"type": "json_object"}
-                if not is_gpt5:
-                    api_params["temperature"] = 0.0
-
-            resp = self.llm_client.chat.completions.create(**api_params)
-            return json.loads(resp.choices[0].message.content)
+            # Use the new Responses API helper
+            response_text = self._call_llm(
+                instructions="You are a vision locator. Output only valid JSON.",
+                prompt=prompt,
+                images=[image_b64],
+                max_tokens=300,
+                json_output=True,
+                temperature=0.0,
+                detail="high"
+            )
+            
+            if response_text:
+                return json.loads(response_text)
+            return None
         except Exception as e:
             print(f"⚠️ Pawn localization failed: {e}")
             return None
@@ -3130,8 +3381,6 @@ JSON schema:
             if not self.llm_enabled or not self.llm_client or not image_b64:
                 return None
 
-            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
-
             prompt = """You are a precise vision locator for a robot gripper camera.
 
 Task: Locate the CHESSBOARD (the 8x8 board) in the image.
@@ -3152,32 +3401,20 @@ JSON schema:
 }
 """
 
-            user_content = [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}", "detail": "high"}},
-            ]
-            messages = [
-                {"role": "system", "content": "You are a vision locator. Output only valid JSON."},
-                {"role": "user", "content": user_content},
-            ]
-
-            # Model-appropriate parameters (gpt-5 and o-series require max_completion_tokens)
-            is_o_series = selected_model.startswith("o")
-            is_gpt5 = selected_model.startswith("gpt-5")
-            api_params = {"model": selected_model, "messages": messages}
-            if is_o_series or is_gpt5:
-                api_params["max_completion_tokens"] = 350
-            else:
-                api_params["max_tokens"] = 350
-
-            # Structured JSON output where supported (not for o-series)
-            if not is_o_series:
-                api_params["response_format"] = {"type": "json_object"}
-                if not is_gpt5:
-                    api_params["temperature"] = 0.0
-
-            resp = self.llm_client.chat.completions.create(**api_params)
-            return json.loads(resp.choices[0].message.content)
+            # Use the new Responses API helper
+            response_text = self._call_llm(
+                instructions="You are a vision locator. Output only valid JSON.",
+                prompt=prompt,
+                images=[image_b64],
+                max_tokens=350,
+                json_output=True,
+                temperature=0.0,
+                detail="high"
+            )
+            
+            if response_text:
+                return json.loads(response_text)
+            return None
         except Exception as e:
             print(f"⚠️ Chessboard localization failed: {e}")
             return None
@@ -3186,18 +3423,18 @@ JSON schema:
         """Set gripper opening percentage (0=open, 100=closed)."""
         try:
             if "gripper" not in self.all_motors:
-                return
+                return False
             val = max(0.0, min(100.0, float(percent)))
             self.bus.write("Goal_Position", "gripper", val, normalize=True)
             time.sleep(0.25)
+            return True
         except Exception as e:
             print(f"⚠️ Gripper command failed: {e}")
+            return False
 
     def _auto_pick_pawn(self, thread: Optional["LLMExecutionThread"] = None) -> Tuple[bool, str]:
-        """Closed-loop routine: overview -> search -> center -> descend -> close -> lift.
+        """Closed-loop pick routine using LLM **tool calls** for move + gripper."""
 
-        Uses ONLY the gripper camera for perception. The LLM is used only to localize the pawn in the image.
-        """
         def emit_status(msg: str):
             if thread:
                 thread.status_update.emit(msg)
@@ -3218,235 +3455,169 @@ JSON schema:
 
         if self.kinematics is None:
             return False, "Kinematics not available (needed for safe Cartesian moves)"
+        if not self.llm_enabled or not self.llm_client:
+            return False, "LLM not available"
 
-        emit_status("🧭 Auto pick: moving to overview...")
-        emit_reasoning("Auto pick pawn: overview → search → center → descend → close → lift\n")
+        emit_status("🧭 Auto pick: overview → search → grasp (LLM tools)...")
+        emit_reasoning("Auto pick pawn: LLM tool calls will drive move + gripper.\n")
 
-        # Open gripper first
-        self._set_gripper(0.0)
+        neutral_roll = float(self._get_wrist_roll_neutral_deg())
 
-        # Helper: try to find a saved pose by fuzzy name
-        def _get_saved_pose(name_candidates: List[str]) -> Optional[Dict[str, float]]:
-            saved = self._load_saved_positions() or {}
-            if not saved:
-                return None
-            # map lower->actual key
-            key_map = {str(k).strip().lower(): k for k in saved.keys()}
-            for cand in name_candidates:
-                k = key_map.get(cand.strip().lower())
-                if k and isinstance(saved.get(k), dict):
-                    pos = saved[k].get("positions")
-                    if isinstance(pos, dict) and pos:
-                        return {m: float(v) for m, v in pos.items() if m in self.all_motors}
-            return None
+        # Pre-open gripper slightly (not fully). The LLM can adjust.
+        try:
+            self._set_gripper(15.0)
+        except Exception:
+            pass
 
-        # Helper: smooth joint-space move to a target pose in small chunks (avoids one big clamp)
-        def _goto_pose(target: Dict[str, float], steps: int = 4, settle_s: float = 0.7) -> bool:
-            try:
-                self.update_position_model()
-                cur = dict(self.position_model.get("joints", {}))
-                for s in range(1, steps + 1):
-                    if thread and not thread.running:
-                        return False
-                    alpha = s / steps
-                    inter_action = {}
-                    for m, tgt in target.items():
-                        if m not in cur:
-                            continue
-                        inter_action[f"{m}.pos"] = float(cur[m]) + (float(tgt) - float(cur[m])) * alpha
-                    safe = self._validate_llm_action(inter_action, cur, is_sequence_step=True)
-                    if safe:
-                        self._execute_llm_action(safe)
-                        time.sleep(settle_s)
-                        self.update_position_model()
-                        cur = dict(self.position_model.get("joints", {}))
-                return True
-            except Exception as e:
-                print(f"⚠️ goto_pose failed: {e}")
-                return False
-
-        # Go to a safe overview pose (prefer user's saved Overview/Ready)
-        self.update_position_model()
-        current_positions = dict(self.position_model.get("joints", {}))
-        saved_overview = _get_saved_pose(["overview", "Overview", "OVERVIEW", "ready", "Ready"])
-        if saved_overview:
-            emit_status("🧭 Auto pick: going to saved OVERVIEW/READY pose...")
-            _goto_pose(saved_overview, steps=5, settle_s=0.7)
-        else:
-            # fallback: generic overview
+        # Go to a generic overview pose (stable, sees more of the board)
+        try:
+            self.update_position_model()
+            cur = dict(self.position_model.get("joints", {}))
             overview_action = {
-                "shoulder_pan.pos": 0.0,
+                "shoulder_pan.pos": float(cur.get("shoulder_pan", 0.0)),
                 "shoulder_lift.pos": 40.0,
                 "elbow_flex.pos": 40.0,
                 "wrist_flex.pos": -30.0,
-                "wrist_roll.pos": 0.0,
-                "gripper.pos": 0.0,
+                "wrist_roll.pos": float(neutral_roll),
             }
-            safe_overview = self._validate_llm_action(overview_action, current_positions, is_sequence_step=True)
+            safe_overview = self._validate_llm_action(overview_action, cur, is_sequence_step=True)
             if safe_overview:
                 self._execute_llm_action(safe_overview)
                 time.sleep(0.7)
+        except Exception:
+            pass
 
-        # Search by sweeping shoulder_pan a bit until pawn is visible
-        emit_status("🔍 Auto pick: searching for pawn...")
-        # IMPORTANT: sweep is PAN-ONLY to avoid changing height while searching (prevents board hits).
-        # We keep the rest of the joints at the current "overview" pose.
-        sweep_angles = [-75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75, 60, 45, 30, 15, 0, -15, -30, -45, -60]
-        last_obs = None
-        for ang in sweep_angles:
+        # We intentionally do NOT gate the grasp loop on a separate "pawn locator" step.
+        # Instead, the tool-driven loop below will:
+        # - decide if the pawn is visible
+        # - scan/zoom out if not visible
+        # - center/approach when visible
+        # - open/close and lift when ready
+        emit_status("🤖 Tool-grasp: LLM will search + grasp using tools...")
+
+        # Tool-driven grasp loop (LLM calls move_gripper_delta / set_gripper_percent)
+        emit_status("🤖 Tool-grasp: LLM will call move + gripper tools...")
+        tools = self._grasp_tool_definitions()
+        prev_response_id: Optional[str] = None
+        max_steps = 35
+
+        for step_idx in range(1, max_steps + 1):
             if thread and not thread.running:
                 return False, "Cancelled"
-            # Small joint motion for search
+
             self.update_position_model()
-            cur = dict(self.position_model.get("joints", {}))
-            act = {"shoulder_pan.pos": float(ang)}
-            safe = self._validate_llm_action(act, cur)
-            if safe:
-                self._execute_llm_action(safe)
-                time.sleep(0.8)  # give camera time to settle (reduces motion blur)
+            ee = self.position_model.get("end_effector", (0, 0, 0))
+            ee_x, ee_y, ee_z = ee
+            gripper_pct = float(self.position_model.get("gripper", 0.0))
 
-            # Sample multiple frames per angle; accept if ANY sees the piece
-            best = None
-            for _ in range(2):
-                img = self.capture_camera_image("gripper")
-                obs = self._llm_locate_pawn(img) if img else None
-                if obs:
-                    last_obs = obs
-                    if best is None or float(obs.get("confidence", 0.0)) > float(best.get("confidence", 0.0)):
-                        best = obs
-                time.sleep(0.15)
+            img = self.capture_camera_image("gripper")
+            if not img:
+                return False, "No gripper image available"
 
-            emit_response(json.dumps(best or last_obs or {"found": False}, indent=2))
-            if best and best.get("found") and float(best.get("confidence", 0.0)) >= 0.35:
-                last_obs = best
-                break
-        else:
-            return False, "Pawn not found in search sweep"
+            emit_status(f"🤖 Tool-grasp step {step_idx}/{max_steps}...")
 
-        # Calibrate a simple image Jacobian for (dx,dy)->(image error) using tiny probe moves
-        def get_err(obs: Dict[str, Any]) -> Optional[Tuple[float, float, float]]:
-            try:
-                c = obs.get("center_norm") or {}
-                bx = obs.get("bbox_norm") or {}
-                ex = float(c.get("x", 0.5)) - 0.5
-                ey = float(c.get("y", 0.5)) - 0.5
-                area = max(0.0, float(bx.get("x2", 0.0)) - float(bx.get("x1", 0.0))) * max(
-                    0.0, float(bx.get("y2", 0.0)) - float(bx.get("y1", 0.0))
-                )
-                return ex, ey, area
-            except Exception:
-                return None
+            tool_prompt = f"""You are controlling a robot arm to GRASP a pawn using ONLY the gripper-mounted camera image.
 
-        emit_status("🎯 Auto pick: centering pawn...")
-        base_img = self.capture_camera_image("gripper")
-        base_obs = self._llm_locate_pawn(base_img) if base_img else None
-        if not base_obs or not base_obs.get("found"):
-            base_obs = last_obs
-        if not base_obs or not base_obs.get("found"):
-            return False, "Lost pawn before centering"
+CRITICAL REALITY:
+- Camera is on the gripper. When close, you usually see ONLY the two jaw tips + a small patch of board.
+- The pawn must end up INSIDE the jaw gap (between tips) before you close.
+- Each square is 1" x 1" ≈ 25.4mm.
 
-        base_err = get_err(base_obs)
-        if not base_err:
-            return False, "Pawn localization malformed"
+CURRENT STATE:
+- End-effector (mm): x={ee_x:.1f}, y={ee_y:.1f}, z={ee_z:.1f}
+- Gripper (%): {gripper_pct:.1f}   (0=open, 100=closed)
+- Wrist roll neutral: {neutral_roll:+.1f}°
 
-        # Default J (fallback): assume dy affects x-error, dx affects y-error
-        J = np.array([[0.0, 0.015], [0.015, 0.0]], dtype=float)  # error per mm (rough)
-        dx_probe = 6.0
-        dy_probe = 6.0
-        try:
-            # Probe +dx
-            self._move_gripper_mm(dx_probe, 0.0, 0.0, apply_ui_step=False)
-            img1 = self.capture_camera_image("gripper")
-            obs1 = self._llm_locate_pawn(img1) if img1 else None
-            self._move_gripper_mm(-dx_probe, 0.0, 0.0, apply_ui_step=False)
-            # Probe +dy
-            self._move_gripper_mm(0.0, dy_probe, 0.0, apply_ui_step=False)
-            img2 = self.capture_camera_image("gripper")
-            obs2 = self._llm_locate_pawn(img2) if img2 else None
-            self._move_gripper_mm(0.0, -dy_probe, 0.0, apply_ui_step=False)
+YOUR JOB:
+- From the image, choose ONE safe next tool call to get the pawn between the jaw tips and then grasp it.
+- Use ONLY these tools:
+  1) move_gripper_delta(dx_mm, dy_mm, dz_mm)
+  2) set_gripper_percent(percent)
+  3) finish_grasp(success, message)
 
-            e0 = get_err(base_obs)
-            e1 = get_err(obs1) if obs1 and obs1.get("found") else None
-            e2 = get_err(obs2) if obs2 and obs2.get("found") else None
-            if e0 and e1 and e2:
-                J = np.array(
-                    [
-                        [(e1[0] - e0[0]) / dx_probe, (e2[0] - e0[0]) / dy_probe],
-                        [(e1[1] - e0[1]) / dx_probe, (e2[1] - e0[1]) / dy_probe],
+MOVE AXES (robot BASE frame):
+- +dx_mm = forward / farther from base
+- +dy_mm = right (same direction as increasing shoulder_pan)
+- +dz_mm = up
+
+RULES:
+- Use small deltas (5–25mm).
+- Keep the gripper SLIGHTLY open while approaching so the pawn can enter the gap:
+  if gripper% <= 5 (fully open), call set_gripper_percent(15) before trying to descend/close.
+- Do NOT descend unless the pawn is centered between the jaw tips.
+- Do NOT close unless the pawn is clearly INSIDE the jaw gap (between tips), not just touching one jaw.
+- If ready: close (85–100) then lift (+dz).
+- If you cannot see any plausible pawn/piece: DO A SMALL SCAN FIRST using move_gripper_delta
+  (typically dz +30..+50 to zoom out, then dy +/-20..25 to sweep). Only finish_grasp(false, ...) if scanning fails.
+
+Now choose the next tool call."""
+
+            input_data = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": tool_prompt},
+                        {"type": "input_image", "image_url": f"data:image/jpeg;base64,{img}", "detail": "high"},
                     ],
-                    dtype=float,
-                )
-        except Exception as e:
-            print(f"⚠️ Jacobian probe failed, using fallback mapping: {e}")
+                }
+            ]
 
-        # Servo loop: center in XY, then descend in Z while re-centering
-        def pinv2(m: np.ndarray) -> np.ndarray:
-            return np.linalg.pinv(m)
+            r1 = self._call_llm_response(
+                instructions="You are a careful grasping assistant. Use function tools to move/open/close safely.",
+                input_items=input_data,
+                tools=tools,
+                tool_choice="auto",
+                max_tool_calls=1,
+                parallel_tool_calls=False,
+                previous_response_id=prev_response_id,
+                max_output_tokens=260,
+                temperature=0.2,
+            )
+            if not r1:
+                return False, "LLM failed during tool-grasp"
 
-        Jinv = pinv2(J)
-        center_tol = 0.06
-        max_center_iters = 10
+            calls = [it for it in getattr(r1, "output", []) if getattr(it, "type", None) == "function_call"]
+            if not calls:
+                if getattr(r1, "output_text", ""):
+                    emit_reasoning(str(r1.output_text))
+                prev_response_id = getattr(r1, "id", prev_response_id)
+                continue
 
-        for i in range(max_center_iters):
-            if thread and not thread.running:
-                return False, "Cancelled"
-            img = self.capture_camera_image("gripper")
-            obs = self._llm_locate_pawn(img) if img else None
-            if not obs or not obs.get("found"):
-                emit_status("⚠️ Auto pick: lost pawn during centering, re-searching...")
-                return False, "Lost pawn during centering"
-            emit_response(json.dumps(obs, indent=2))
-            ex, ey, area = get_err(obs) or (0.0, 0.0, 0.0)
-            emit_status(f"🎯 Centering: err=({ex:+.3f},{ey:+.3f}) area={area:.3f}")
-            if abs(ex) < center_tol and abs(ey) < center_tol:
-                break
+            call = calls[0]
+            tool_name = getattr(call, "name", "")
+            tool_args_raw = getattr(call, "arguments", "{}")
+            try:
+                tool_args = json.loads(tool_args_raw) if isinstance(tool_args_raw, str) else (tool_args_raw or {})
+            except Exception:
+                tool_args = {}
 
-            e = np.array([ex, ey], dtype=float)
-            # Gain: smaller steps when close (area grows as we get closer)
-            gain = 0.65 if area < 0.02 else 0.4
-            dxy = -gain * (Jinv @ e)
-            dx_cmd = float(np.clip(dxy[0] * 100.0, -10.0, 10.0))  # scale to mm
-            dy_cmd = float(np.clip(dxy[1] * 100.0, -10.0, 10.0))
-            self._move_gripper_mm(dx_cmd, dy_cmd, 0.0, apply_ui_step=False)
+            tool_result = self._execute_grasp_tool_call(
+                str(tool_name), dict(tool_args) if isinstance(tool_args, dict) else {}
+            )
+            emit_response(json.dumps({"tool": tool_name, "args": tool_args, "result": tool_result}, indent=2))
 
-        # Approach: descend in small increments while keeping centered
-        emit_status("⬇️ Auto pick: approaching pawn...")
-        max_descend_steps = 8
-        for step in range(max_descend_steps):
-            if thread and not thread.running:
-                return False, "Cancelled"
-            img = self.capture_camera_image("gripper")
-            obs = self._llm_locate_pawn(img) if img else None
-            if not obs or not obs.get("found"):
-                return False, "Lost pawn during approach"
-            emit_response(json.dumps(obs, indent=2))
-            ex, ey, area = get_err(obs) or (0.0, 0.0, 0.0)
+            follow_input = [
+                {"type": "function_call_output", "call_id": str(getattr(call, "call_id", "")), "output": json.dumps(tool_result)},
+                {"role": "user", "content": [{"type": "input_text", "text": "In 1-2 sentences: what did you do and what should happen next?"}]},
+            ]
+            r2 = self._call_llm_response(
+                previous_response_id=str(getattr(r1, "id", "")),
+                input_items=follow_input,
+                tool_choice="none",
+                max_output_tokens=160,
+                temperature=0.0,
+            )
+            if r2 and getattr(r2, "output_text", ""):
+                emit_reasoning(str(r2.output_text))
 
-            # Re-center a bit
-            if abs(ex) > center_tol or abs(ey) > center_tol:
-                e = np.array([ex, ey], dtype=float)
-                dxy = -(0.35 * (Jinv @ e))
-                dx_cmd = float(np.clip(dxy[0] * 100.0, -6.0, 6.0))
-                dy_cmd = float(np.clip(dxy[1] * 100.0, -6.0, 6.0))
-                self._move_gripper_mm(dx_cmd, dy_cmd, 0.0, apply_ui_step=False)
+            prev_response_id = getattr(r2, "id", getattr(r1, "id", prev_response_id))
 
-            # If the pawn is "big enough" in view, start grasp
-            if area >= 0.035:
-                break
+            if str(tool_name) == "finish_grasp":
+                return bool(tool_result.get("success", False)), str(tool_result.get("message", "Finished"))
 
-            # Descend a little (dz clamp inside move)
-            self._move_gripper_mm(0.0, 0.0, -5.0, apply_ui_step=False)
+            time.sleep(0.25)
 
-        # Final grasp
-        emit_status("🤏 Auto pick: grasping...")
-        self._move_gripper_mm(0.0, 0.0, -4.0, apply_ui_step=False)
-        self._set_gripper(85.0)
-        time.sleep(0.4)
-        emit_status("⬆️ Auto pick: lifting...")
-        self._move_gripper_mm(0.0, 0.0, +25.0, apply_ui_step=False)
-        time.sleep(0.6)
-
-        return True, "Auto pick completed (check gripper for pawn)"
+        return False, f"Tool-grasp exceeded {max_steps} steps"
     
     def _start_llm_execution_thread(self):
         """Start LLM execution in background thread to prevent UI blocking."""
@@ -3548,7 +3719,7 @@ JSON schema:
         
         # Track iteration history
         iteration_history = []
-        max_iterations = 25  # Increased to allow more attempts to reach goal
+        max_iterations = 100  # Allow many iterations for complex goals
         iteration = 0
         consecutive_failures = 0  # Track repeated failures to detect stuck state
         last_action_hash = None  # Track if we're repeating the same action
@@ -3625,12 +3796,39 @@ JSON schema:
                 # Execute the action
                 sequence = llm_output.get("sequence", None)
                 action = llm_output.get("action", {})
+                ee_delta = llm_output.get("ee_delta", None)
                 
                 executed = False
                 execution_error = None
                 
                 try:
-                    if sequence:
+                    if ee_delta is not None:
+                        if self.kinematics is None:
+                            execution_error = "Cartesian ee_delta requested but kinematics not available"
+                            executed = False
+                        else:
+                            # Parse ee_delta (dict or [dx,dy,dz])
+                            dx = dy = dz = 0.0
+                            if isinstance(ee_delta, dict):
+                                dx = float(ee_delta.get("dx_mm", ee_delta.get("dx", 0.0)))
+                                dy = float(ee_delta.get("dy_mm", ee_delta.get("dy", 0.0)))
+                                dz = float(ee_delta.get("dz_mm", ee_delta.get("dz", 0.0)))
+                            elif isinstance(ee_delta, (list, tuple)) and len(ee_delta) >= 3:
+                                dx = float(ee_delta[0])
+                                dy = float(ee_delta[1])
+                                dz = float(ee_delta[2])
+                            else:
+                                raise ValueError("ee_delta must be an object {dx_mm,dy_mm,dz_mm} or a 3-item list [dx,dy,dz]")
+
+                            # Safety clamp (the move function has additional clamps)
+                            dx = float(np.clip(dx, -40.0, 40.0))
+                            dy = float(np.clip(dy, -40.0, 40.0))
+                            dz = float(np.clip(dz, -12.0, 40.0))
+
+                            executed = bool(self._move_gripper_mm(dx, dy, dz, apply_ui_step=False))
+                            if not executed:
+                                execution_error = "ee_delta move failed (see Execution Log)"
+                    elif sequence:
                         executed = self._execute_llm_sequence(sequence, current_positions, original_command=command)
                         if not executed:
                             execution_error = "Sequence stopped (likely due to overload)"
@@ -3717,18 +3915,30 @@ JSON schema:
                         f"\n⚠️ Robot barely moved (Δ={total_change:.1f}°) - may be stuck or overloaded\n"
                     )
                 
+                # Get end-effector positions before and after
+                self.update_position_model()
+                ee_before = self.position_model.get("end_effector", (0, 0, 0))
+                
                 # Check if goal is reached
                 goal_reached, completion_feedback = self._check_goal_completion(
                     command, new_positions, image_data, action_executed=True, position_change=total_change  # Use updated positions
                 )
                 
-                # Record iteration
+                # Update position model again to get post-action EE position
+                self.update_position_model()
+                ee_after = self.position_model.get("end_effector", (0, 0, 0))
+                
+                # Record iteration with position tracking
                 iteration_history.append({
                     "iteration": iteration,
                     "action": llm_output,
+                    "positions_before": dict(current_positions),  # Store positions before action
+                    "positions_after": dict(new_positions),  # Store positions after action
+                    "ee_before": tuple(ee_before),  # End-effector position before
+                    "ee_after": tuple(ee_after),  # End-effector position after
+                    "position_change": total_change,
                     "goal_reached": goal_reached,
-                    "feedback": completion_feedback,
-                    "position_change": total_change
+                    "feedback": completion_feedback
                 })
                 
                 # Update display
@@ -3800,6 +4010,9 @@ JSON schema:
                 current_positions["shoulder_pan"],
                 current_positions["shoulder_lift"]
             )
+
+        # Wrist roll neutral (m5) calibration: should correspond to gripper parallel to the ground.
+        neutral_roll = self._get_wrist_roll_neutral_deg()
         
         # Get board info
         board_info = self.get_chess_board_info()
@@ -3807,14 +4020,54 @@ JSON schema:
         if board_info:
             board_context = f"\nChess Board: Calibrated, current square: {current_square if current_square else 'unknown'}"
         
-        # Build history summary
+        # Build history summary with position tracking
         history_text = ""
         if history:
-            history_text = "\n\nPrevious iterations:\n"
+            history_text = "\n\nPREVIOUS ITERATIONS (position trajectory):\n"
             for h in history[-3:]:  # Last 3 iterations
                 hist_iter = h.get("iteration", 0)
                 hist_feedback = h.get("feedback", "")
-                history_text += f"  Iteration {hist_iter}: {hist_feedback[:100]}...\n"
+                pos_before = h.get("positions_before", {})
+                pos_after = h.get("positions_after", {})
+                pos_change = h.get("position_change", 0.0)
+                
+                # Calculate key position deltas
+                deltas = []
+                for motor in ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]:
+                    if motor in pos_before and motor in pos_after:
+                        delta = pos_after[motor] - pos_before[motor]
+                        if abs(delta) > 0.5:  # Only show significant changes
+                            deltas.append(f"{motor}: {pos_before[motor]:+.1f}° → {pos_after[motor]:+.1f}° (Δ{delta:+.1f}°)")
+                
+                # End-effector position change
+                ee_before = h.get("ee_before", (0, 0, 0))
+                ee_after = h.get("ee_after", (0, 0, 0))
+                ee_delta = tuple(ee_after[i] - ee_before[i] for i in range(3)) if len(ee_before) == 3 and len(ee_after) == 3 else (0, 0, 0)
+                ee_dist = (ee_delta[0]**2 + ee_delta[1]**2 + ee_delta[2]**2)**0.5
+                
+                history_text += f"  Iteration {hist_iter}:\n"
+                history_text += f"    Total joint movement: {pos_change:.1f}°\n"
+                if ee_dist > 1.0:  # Only show if significant spatial movement
+                    history_text += f"    EE position: ({ee_before[0]:.0f},{ee_before[1]:.0f},{ee_before[2]:.0f}) → ({ee_after[0]:.0f},{ee_after[1]:.0f},{ee_after[2]:.0f}) mm (Δ{ee_dist:.1f}mm)\n"
+                if deltas:
+                    history_text += f"    Joint changes: {', '.join(deltas[:4])}\n"  # Show up to 4 motor changes
+                history_text += f"    Feedback: {hist_feedback[:120]}\n"
+        
+        # Get current end-effector position
+        self.update_position_model()
+        ee_pos = self.position_model.get("end_effector", (0, 0, 0))
+        ee_x, ee_y, ee_z = ee_pos
+        
+        # Calculate position trajectory summary
+        trajectory_summary = ""
+        if len(history) >= 2:
+            # Show if we're making progress (position changes)
+            recent_changes = [h.get("position_change", 0.0) for h in history[-3:]]
+            avg_change = sum(recent_changes) / len(recent_changes) if recent_changes else 0.0
+            if avg_change < 2.0:
+                trajectory_summary = "\n⚠️ WARNING: Recent movements have been very small (<2°). Consider larger steps or different approach."
+            elif avg_change > 50.0:
+                trajectory_summary = "\n⚠️ WARNING: Recent movements have been very large (>50°). Consider smaller, more precise steps."
         
         context = f"""GOAL-DRIVEN EXECUTION - Iteration {iteration}
 
@@ -3822,19 +4075,22 @@ ORIGINAL GOAL: {original_command}
 
 CURRENT STATE:
 - Joint positions: {json.dumps(current_positions, indent=2)}
+- End-effector position: x={ee_x:.1f}mm, y={ee_y:.1f}mm, z={ee_z:.1f}mm
 - Current square: {current_square if current_square else "unknown"}
 {board_context}
-{history_text}
+{history_text}{trajectory_summary}
 
 RECENT EXECUTION LOGS (critical, read carefully):
 {self._get_recent_exec_logs_for_prompt() if self._get_recent_exec_logs_for_prompt() else "(none)"}
 
 YOUR TASK:
 Based on the goal and current state, determine what action to take NEXT.
+- Review the PREVIOUS ITERATIONS to see what positions you've been at and what movements you've made
 - If goal is not yet achieved, plan the next step toward the goal
 - If you're close but not quite there, make a small adjustment
 - If you need to see more, move to overview position first
 - Keep actions incremental and safe
+- Use the position trajectory to avoid repeating the same movements
 
 Output either a single action or a short sequence (1-3 steps max per iteration).
 """
@@ -3843,70 +4099,40 @@ Output either a single action or a short sequence (1-3 steps max per iteration).
     def _get_llm_action(self, context: str, image_data, current_positions: Dict[str, float]) -> Optional[Dict]:
         """Get next action from LLM given context."""
         try:
-            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
-            
             # Build prompt with context
-            base_prompt = self._build_llm_prompt("", current_positions)  # Get base prompt structure
-            # Replace the command part with our iteration context
-            full_prompt = base_prompt.replace('User command: ""', f'Iteration Context:\n{context}')
+            # NOTE: Previously this used a fragile string replace that could fail and drop the iteration context.
+            full_prompt = self._build_llm_prompt(f"GOAL-DRIVEN ITERATION CONTEXT:\n{context}", current_positions)
             
-            # Build messages
+            # Prepare images list
+            images = None
             if image_data:
-                # Count and log images being sent
                 if isinstance(image_data, list):
-                    valid_images = [img for img in image_data if img]
-                    img_sizes = [len(img) // 1024 for img in valid_images]  # Size in KB
-                    print(f"📷 Sending {len(valid_images)} image(s) to LLM: {img_sizes} KB each")
+                    images = [img for img in image_data if img]
+                    img_sizes = [len(img) // 1024 for img in images]
+                    print(f"📷 Sending {len(images)} image(s) to LLM: {img_sizes} KB each")
                 else:
+                    images = [image_data]
                     img_size = len(image_data) // 1024
                     print(f"📷 Sending 1 image to LLM: {img_size} KB")
-                
-                user_content = [{"type": "text", "text": full_prompt}]
-                if isinstance(image_data, list):
-                    for i, img in enumerate(image_data):
-                        if img:
-                            user_content.append({
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "high"}
-                            })
-                            print(f"   📎 Image {i+1} attached (base64 length: {len(img)})")
-                else:
-                    if image_data:
-                        user_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_data}", "detail": "high"}
-                        })
-                        print(f"   📎 Image attached (base64 length: {len(image_data)})")
-                
-                messages = [
-                    {"role": "system", "content": "You are a robot control assistant. Analyze the current state and plan the next action toward the goal. Output only valid JSON."},
-                    {"role": "user", "content": user_content}
-                ]
             else:
                 print("📷 No image data - sending text-only request to LLM")
-                messages = [
-                    {"role": "system", "content": "You are a robot control assistant. Analyze the current state and plan the next action toward the goal. Output only valid JSON."},
-                    {"role": "user", "content": full_prompt}
-                ]
-            
-            # Call LLM
-            is_reasoning_model = selected_model.startswith("o1") or selected_model.startswith("o3") or selected_model.startswith("o4")
-            
-            api_params = {
-                "model": selected_model,
-                "messages": messages
-            }
-            
-            if not is_reasoning_model:
-                api_params["response_format"] = {"type": "json_object"}
-                if not selected_model.startswith("gpt-5"):
-                    api_params["temperature"] = 0.3
-            else:
-                api_params["reasoning_effort"] = self.reasoning_effort_combo.currentText()
-            
-            response = self.llm_client.chat.completions.create(**api_params)
-            response_content = response.choices[0].message.content
-            return json.loads(response_content)
+
+            # For goal-driven tasks, we keep the older JSON schema (action/sequence/ee_delta).
+            # Tool-calling is used in the dedicated pawn grasp loop (pick pawn), where the LLM
+            # calls move_gripper_delta / set_gripper_percent directly.
+            response_text = self._call_llm(
+                instructions="You are a robot control assistant with vision. Output only valid JSON.",
+                prompt=full_prompt,
+                images=images,
+                max_tokens=800,
+                json_output=True,
+                temperature=0.3,
+                detail="high",
+            )
+
+            if response_text:
+                return json.loads(response_text)
+            return None
             
         except Exception as e:
             print(f"⚠️ LLM action request failed: {e}")
@@ -3953,8 +4179,6 @@ Output either a single action or a short sequence (1-3 steps max per iteration).
                         current_square: Optional[str], image_data) -> Tuple[bool, str]:
         """LLM-based goal completion judge - analyzes scene to determine if goal is reached."""
         try:
-            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
-            
             # Build judge prompt
             judge_prompt = f"""GOAL COMPLETION JUDGE
 
@@ -3980,47 +4204,32 @@ Examples:
 - Goal: "pick up piece" → reached if piece is in gripper
 """
             
-            user_content = [{"type": "text", "text": judge_prompt}]
+            # Prepare images list
+            images = None
+            if image_data:
+                if isinstance(image_data, list):
+                    images = [img for img in image_data if img]
+                else:
+                    images = [image_data]
             
-            if isinstance(image_data, list):
-                for img in image_data:
-                    if img:
-                        user_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "high"}
-                        })
-            else:
-                if image_data:
-                    user_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}", "detail": "high"}
-                    })
+            # Use the new Responses API helper
+            response_text = self._call_llm(
+                instructions="You are a goal completion judge. Analyze if the robot has achieved its goal. Output only valid JSON.",
+                prompt=judge_prompt,
+                images=images,
+                max_tokens=400,
+                json_output=True,
+                temperature=0.2,
+                detail="high"
+            )
             
-            messages = [
-                {"role": "system", "content": "You are a goal completion judge. Analyze if the robot has achieved its goal. Output only valid JSON."},
-                {"role": "user", "content": user_content}
-            ]
-            
-            is_reasoning_model = selected_model.startswith("o1") or selected_model.startswith("o3") or selected_model.startswith("o4")
-            
-            api_params = {
-                "model": selected_model,
-                "messages": messages
-            }
-            
-            if not is_reasoning_model:
-                api_params["response_format"] = {"type": "json_object"}
-                if not selected_model.startswith("gpt-5"):
-                    api_params["temperature"] = 0.2  # Lower temp for more consistent judging
-            else:
-                api_params["reasoning_effort"] = "low"  # Faster for judging
-            
-            response = self.llm_client.chat.completions.create(**api_params)
-            result = json.loads(response.choices[0].message.content)
-            
-            goal_reached = result.get("goal_reached", False)
-            feedback = result.get("feedback", "No feedback")
-            whats_missing = result.get("whats_missing", "")
+            if not response_text:
+                return False, "No response from LLM"
+
+            result = json.loads(response_text)
+            goal_reached = bool(result.get("goal_reached", False))
+            feedback = str(result.get("feedback", "No feedback"))
+            whats_missing = str(result.get("whats_missing", ""))
             
             full_feedback = feedback
             if whats_missing and not goal_reached:
@@ -4074,6 +4283,9 @@ Examples:
                 current_positions["shoulder_pan"],
                 current_positions["shoulder_lift"]
             )
+
+        # Wrist roll neutral (m5) calibration: should correspond to gripper parallel to the ground.
+        neutral_roll = self._get_wrist_roll_neutral_deg()
         
         # Get chess board calibration info
         board_info = self.get_chess_board_info()
@@ -4106,7 +4318,7 @@ WORKSPACE ESTIMATE (from your mechanical/calibration limits; use this to avoid '
 - Joint limits (deg): {json.dumps(jl)}
 - Recommended SCAN pose (deg): {json.dumps(rec)}
 Notes:
-- Keep wrist_roll near 0° during scanning (prevents camera from looking sideways).
+- Keep wrist_roll near {neutral_roll:+.1f}° during scanning (your calibrated neutral; gripper parallel to ground).
 - Keep wrist_flex negative (e.g. -20° to -45°) to look down at the board.
 """
 
@@ -4122,7 +4334,7 @@ BOARD VIEW LOCALIZATION (camera + motor feedback):
 - Learned board-centered shoulder_pan (m1): pan_center_deg={float(pan_center):+.1f}°
 - Current m1 centeredness error: (shoulder_pan - pan_center_deg) = {m1_err:+.1f}°
 - Use shoulder_pan as the PRIMARY left/right centering control while scanning/approaching.
-- Keep wrist_roll near 0° during scanning (prevents looking sideways).
+- Keep wrist_roll near {neutral_roll:+.1f}° during scanning (your calibrated neutral; gripper parallel to ground).
 """
         except Exception:
             board_view_context = ""
@@ -4149,16 +4361,35 @@ You can use these saved positions to:
 
 ⚠️ CRITICAL: THE CAMERA IS MOUNTED ON THE GRIPPER
 - The camera sees what the gripper sees
+- When you are close to the board, you will often see ONLY the **two jaw tips** (and a small patch of board).
+  The rest of the arm is usually NOT visible. The space between the jaw tips is the grasping area.
 - To "zoom out" and see the full board: RAISE the arm (lift shoulder, extend elbow)
 - To "zoom in" on a square: LOWER the arm toward the board
 - When close to board, camera sees only a small area around gripper
+
+PHYSICAL SCALE (for planning with mm deltas):
+- Assume each chess square is 1\" x 1\" (≈25.4mm x 25.4mm).
+- Board side is ≈8\" (≈203mm).
 
 MOTOR REFERENCE (what each motor does):
 - shoulder_pan: Rotates arm LEFT/RIGHT (negative=left, positive=right)
 - shoulder_lift: Tilts arm UP/DOWN (negative=down toward board, positive=up away)
 - elbow_flex: Extends/retracts forearm (negative=retracted/close, positive=extended/far)
 - wrist_flex: Angles gripper UP/DOWN (negative=gripper points down, positive=gripper points up)
+- wrist_roll: Rotates the gripper around its axis (use neutral {neutral_roll:+.1f}° so jaws are parallel to ground; avoid sideways camera)
 - gripper: Opens/closes jaws (0=fully open, 100=fully closed)
+
+GRASPING A PAWN (mechanics checklist):
+1) Pre-grasp orientation:
+   - Set wrist_roll near neutral {neutral_roll:+.1f}° so the jaws are parallel to the ground.
+2) Pre-grasp opening:
+   - Open the gripper PARTIALLY (NOT fully) so the gap is slightly wider than the pawn.
+   - Typical starting value: gripper.pos ≈ 10–25 (remember: 0=open, 100=closed).
+3) Alignment:
+   - Move until the pawn is centered between the two jaw tips and fully INSIDE the jaw gap.
+   - Do NOT close if the pawn is outside the gap or only touching one jaw.
+4) Close + lift:
+   - Close gripper to grasp: gripper.pos ≈ 85–100, then lift up (increase z / shoulder_lift) while keeping the pawn in view.
 
 KEY POSITIONS (approximate joint angles):
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -4244,6 +4475,16 @@ For single actions (simple movements only):
   "explanation": "<brief explanation>"
 }}
 
+For CARTESIAN delta moves (small, precise nudges; uses IK when available):
+{{
+  "ee_delta": {{"dx_mm": <float>, "dy_mm": <float>, "dz_mm": <float>}},
+  "explanation": "<brief explanation>"
+}}
+Notes:
+- dx/dy/dz are in millimeters in the ROBOT BASE frame.
+- Use small values (typically 5–25mm). Large moves will be clamped for safety.
+- Downward dz is negative; the system will clamp downward steps to avoid hitting the board.
+
 CRITICAL RULES:
 1. For ANY "find", "locate", "go to" task: ALWAYS start with OVERVIEW position
 2. Camera is on gripper - you can't see the board when arm is folded at rest
@@ -4252,7 +4493,7 @@ CRITICAL RULES:
 5. Then lower incrementally to approach
 6. You can make larger movements (up to 40° per motor per step) - system will handle overload detection
 7. Use wait_after 0.5-1.0s for movements
-8. You have up to 25 iterations to reach the goal - be methodical and make progress each step
+8. You have up to 100 iterations to reach the goal - be methodical and make progress each step
 9. A fresh camera image is captured before each iteration - use it to verify progress
 """
         return prompt
@@ -4336,7 +4577,7 @@ CRITICAL RULES:
         
         if not safe_action:
             print("⚠️ Validation failed: no valid motors in action")
-
+        
         if not safe_action:
             return None
 
@@ -4393,60 +4634,57 @@ CRITICAL RULES:
         """
         try:
             # Build dict of motor positions for sync_write
-            motor_positions = {}
+            motor_positions: Dict[str, float] = {}
             for motor_key, value in action.items():
                 motor_name = motor_key.replace(".pos", "")
                 if motor_name in self.all_motors:
-                    motor_positions[motor_name] = value
-            
+                    motor_positions[motor_name] = float(value)
+
             if not motor_positions:
-                print("   ⚠️ No valid motor positions in action")
+                self._append_exec_log("warning", "No valid motor positions in action")
                 return
-            
-            # Log what we're about to do
-            print(f"   🔄 Coordinated move: {', '.join([f'{k}={v:.1f}°' for k,v in motor_positions.items()])}")
-            
+
+            self._append_exec_log(
+                "info",
+                "Coordinated move: "
+                + ", ".join([f"{k}={v:.1f}" + ("%" if k == "gripper" else "°") for k, v in motor_positions.items()]),
+            )
+
             try:
                 # Use sync_write to move ALL motors SIMULTANEOUSLY
-                # This avoids interference issues where one motor blocks another
                 self.bus.sync_write("Goal_Position", motor_positions, normalize=True)
-                print(f"   ✓ sync_write completed for {len(motor_positions)} motors")
-                
             except Exception as e:
                 error_msg = str(e).lower()
-                print(f"   ⚠️ sync_write failed: {e}")
-                
+                self._append_exec_log("error", f"sync_write failed: {e}")
+
                 # Check for specific errors
                 if "overload" in error_msg:
-                    print("   🔥 OVERLOAD detected!")
-                    print("   ⏸️ Pausing 3 seconds due to overload...")
+                    self._append_exec_log("error", "OVERLOAD detected - pausing 3s and stopping action for safety")
                     time.sleep(3.0)
                     raise RuntimeError("Motor overload detected - action stopped for safety")
-                
+
                 if "port is in use" in error_msg or ("port" in error_msg and "use" in error_msg):
-                    print("   🔌 PORT CONFLICT detected")
-                    print("   ⏸️ Pausing 1 second...")
+                    self._append_exec_log("warning", "Port conflict detected - pausing 1s")
                     time.sleep(1.0)
-                
+
                 # Fall back to sequential writes if sync_write fails
-                print("   📝 Falling back to sequential writes...")
+                self._append_exec_log("warning", "Falling back to sequential writes...")
                 for motor_name, value in motor_positions.items():
                     try:
                         self.bus.write("Goal_Position", motor_name, value, normalize=True)
-                        time.sleep(0.05)  # Minimal delay between motors
+                        time.sleep(0.05)
                     except Exception as e2:
-                        print(f"   ⚠️ {motor_name} write error: {e2}")
-            
-            # Wait for motors to reach target
+                        self._append_exec_log("warning", f"{motor_name} write error: {e2}")
+
+            # Wait briefly for motors to start moving
             time.sleep(0.5)
-            
+
             # Update position model after execution
             self.update_position_model()
-            
             self.status_bar.setText("✅ LLM action executed")
-            
+
         except RuntimeError:
-            raise  # Re-raise overload errors
+            raise
         except Exception as e:
             self.status_bar.setText(f"❌ Execution error: {str(e)[:50]}...")
             raise
@@ -4521,20 +4759,19 @@ CRITICAL RULES:
                         # This avoids interference issues where one motor blocks another
                         self.bus.sync_write("Goal_Position", motor_positions, normalize=True)
                         print(f"   ✓ sync_write: {len(motor_positions)} motors moved together")
-                        
                     except Exception as e:
                         error_msg = str(e).lower()
                         print(f"   ⚠️ sync_write failed: {e}")
-                        
+
                         # Check for specific errors
                         if "overload" in error_msg:
                             overload_detected = True
-                            print(f"   🔥 OVERLOAD detected - stopping sequence")
-                        
+                            print("   🔥 OVERLOAD detected - stopping sequence")
+
                         if "port is in use" in error_msg or ("port" in error_msg and "use" in error_msg):
                             port_conflict = True
-                            print(f"   🔌 PORT CONFLICT detected - pausing")
-                        
+                            print("   🔌 PORT CONFLICT detected - pausing")
+
                         # Fall back to sequential writes if sync_write fails
                         if not overload_detected and not port_conflict:
                             print("   📝 Falling back to sequential writes...")
@@ -4657,8 +4894,6 @@ CRITICAL RULES:
             if not self.llm_enabled or not self.llm_client:
                 return None
             
-            selected_model = self.llm_model_combo.currentText().replace(" 👁️", "").strip()
-            
             # Get current square if available
             current_square = None
             if "shoulder_pan" in current_positions and "shoulder_lift" in current_positions:
@@ -4701,42 +4936,27 @@ Guidelines:
 - Focus on getting the target in view or getting closer to it
 """
             
-            # Build vision message
-            user_content = [{"type": "text", "text": prompt}]
+            # Prepare images list
+            images = None
+            if image_data:
+                if isinstance(image_data, list):
+                    images = [img for img in image_data if img]
+                else:
+                    images = [image_data]
             
-            if isinstance(image_data, list):
-                for img in image_data:
-                    if img:
-                        user_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "low"}
-                        })
-            else:
-                if image_data:
-                    user_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_data}", "detail": "low"}
-                    })
+            # Use the new Responses API helper
+            response_text = self._call_llm(
+                instructions="You are a robot control assistant with vision. Analyze scenes and suggest adjustments. Output only valid JSON.",
+                prompt=prompt,
+                images=images,
+                max_tokens=500,
+                json_output=True,
+                detail="low"
+            )
             
-            messages = [
-                {"role": "system", "content": "You are a robot control assistant with vision. Analyze scenes and suggest adjustments. Output only valid JSON."},
-                {"role": "user", "content": user_content}
-            ]
-            
-            # Get response - use model-appropriate parameters
-            api_params = {
-                "model": selected_model,
-                "messages": messages,
-            }
-            if not selected_model.startswith("o"):
-                api_params["max_tokens"] = 500
-                api_params["response_format"] = {"type": "json_object"}
-            else:
-                api_params["max_completion_tokens"] = 500
-            response = self.llm_client.chat.completions.create(**api_params)
-            
-            result = json.loads(response.choices[0].message.content)
-            return result
+            if response_text:
+                return json.loads(response_text)
+            return None
             
         except Exception as e:
             print(f"⚠️ Adaptive feedback failed: {e}")
@@ -4804,13 +5024,57 @@ Guidelines:
                     target_x = float(T_target[0, 3] * 1000.0)
                     target_y = float(T_target[1, 3] * 1000.0)
                     target_z = float(T_target[2, 3] * 1000.0)
-                    distance = float(np.sqrt(target_x**2 + target_y**2 + target_z**2))
-                    if distance > 450:
-                        self.status_bar.setText("❌ Target outside workspace bounds!")
-                        return
-                    if distance < 80:
-                        self.status_bar.setText("❌ Target too close to base!")
-                        return
+                    bounds = (getattr(self, "workspace_estimate", None) or {}).get("ee_bounds_mm") or {}
+                    if bounds:
+                        x_min = float(bounds.get("x_min", -1e9))
+                        x_max = float(bounds.get("x_max", 1e9))
+                        y_min = float(bounds.get("y_min", -1e9))
+                        y_max = float(bounds.get("y_max", 1e9))
+                        z_min = float(bounds.get("z_min", -1e9))
+                        z_max = float(bounds.get("z_max", 1e9))
+
+                        # Allow slight excursions (sampling-based bounds are approximate)
+                        soft_margin_mm = 25.0
+                        hard_margin_mm = 70.0
+
+                        hard_out = (
+                            target_x < x_min - hard_margin_mm
+                            or target_x > x_max + hard_margin_mm
+                            or target_y < y_min - hard_margin_mm
+                            or target_y > y_max + hard_margin_mm
+                            or target_z < z_min - hard_margin_mm
+                            or target_z > z_max + hard_margin_mm
+                        )
+                        if hard_out:
+                            msg = (
+                                f"❌ Target outside workspace bounds (hard): "
+                                f"target=({target_x:.1f},{target_y:.1f},{target_z:.1f})mm "
+                                f"bounds= x[{x_min:.0f},{x_max:.0f}] y[{y_min:.0f},{y_max:.0f}] z[{z_min:.0f},{z_max:.0f}]"
+                            )
+                            self._append_exec_log("error", msg)
+                            self.status_bar.setText("❌ Target outside workspace bounds (hard stop)")
+                            return False
+
+                        soft_out = (
+                            target_x < x_min - soft_margin_mm
+                            or target_x > x_max + soft_margin_mm
+                            or target_y < y_min - soft_margin_mm
+                            or target_y > y_max + soft_margin_mm
+                            or target_z < z_min - soft_margin_mm
+                            or target_z > z_max + soft_margin_mm
+                        )
+                        if soft_out:
+                            self._append_exec_log(
+                                "warning",
+                                f"Target slightly outside estimated workspace (soft): "
+                                f"({target_x:.1f},{target_y:.1f},{target_z:.1f})mm",
+                            )
+                    else:
+                        # Fallback (no estimate): very coarse spherical constraint
+                        distance = float(np.sqrt(target_x**2 + target_y**2 + target_z**2))
+                        if distance > 450:
+                            self.status_bar.setText("❌ Target outside workspace bounds!")
+                            return False
 
                     # Solve IK
                     target_joints = self.kinematics.inverse_kinematics(
@@ -4832,9 +5096,11 @@ Guidelines:
                     time.sleep(0.4)
 
                     self.status_bar.setText(f"✅ Moved toward ({target_x:.1f}, {target_y:.1f}, {target_z:.1f})")
+                    return True
                     
                 except Exception as e:
                     self.status_bar.setText(f"❌ IK failed: {str(e)[:50]}...")
+                    return False
             else:
                 # Simple joint-space movement approximation
                 self.status_bar.setText("⚠️ Simple movement (no IK available)")
@@ -4853,11 +5119,13 @@ Guidelines:
                 
                 time.sleep(1)
                 self.status_bar.setText("✅ Joint movement completed")
+                return True
         
         except Exception as e:
             # Full error goes to execution log; status bar is short by design.
             self._append_exec_log("error", f"Movement failed: {e}")
             self.status_bar.setText("❌ Movement failed (see Execution Log)")
+            return False
 
     def move_gripper(self, dx_mm, dy_mm, dz_mm):
         """UI-friendly wrapper: uses the step-size combo scaling."""
@@ -5659,12 +5927,12 @@ Guidelines:
             corners_xyz = np.array([c['xyz'] for c in corners_data])
             
             # Define board frame: a1 at origin, h1 along +X, a8 along +Y
-            # 8 squares × 50mm = 400mm = 0.4m
+            # Assume each square is 1" = 25.4mm -> 8 squares = 203.2mm = 0.2032m
             board_corners_ideal = np.array([
                 [0.0, 0.0, 0.0],      # a1
-                [0.4, 0.0, 0.0],      # h1
-                [0.4, 0.4, 0.0],      # h8
-                [0.0, 0.4, 0.0],      # a8
+                [0.2032, 0.0, 0.0],      # h1
+                [0.2032, 0.2032, 0.0],   # h8
+                [0.0, 0.2032, 0.0],      # a8
             ])
             
             # Calculate rigid transform from board frame to robot base frame
@@ -5694,7 +5962,7 @@ Guidelines:
             
             # Create board model
             board_model = BoardModel(
-                params=ChessBoardParams(square_size_mm=50.0),
+                params=ChessBoardParams(square_size_mm=25.4),
                 T_base_board=T_base_board
             )
             
@@ -5885,6 +6153,35 @@ class ManualMotorControlDialog(QDialog):
         refresh_btn = QPushButton("🔄 REFRESH POSITIONS")
         refresh_btn.clicked.connect(self.refresh_all_positions)
         button_layout.addWidget(refresh_btn)
+
+        # Save wrist_roll (m5) calibration helpers
+        set_m5_neutral_btn = QPushButton("📌 SET M5 NEUTRAL")
+        set_m5_neutral_btn.setToolTip("Save current wrist_roll as NEUTRAL (gripper parallel to the ground)")
+        set_m5_neutral_btn.clicked.connect(self.save_m5_neutral)
+        set_m5_neutral_btn.setStyleSheet("""
+            QPushButton {
+                background: #238636;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #2ea043;
+            }
+        """)
+        button_layout.addWidget(set_m5_neutral_btn)
+
+        set_m5_pick_btn = QPushButton("🤏 SET M5 PICK")
+        set_m5_pick_btn.setToolTip("Save current wrist_roll as PICK roll (used for grasp orientation)")
+        set_m5_pick_btn.clicked.connect(self.save_m5_pick)
+        set_m5_pick_btn.setStyleSheet("""
+            QPushButton {
+                background: #1f6feb;
+                color: white;
+            }
+            QPushButton:hover {
+                background: #388bfd;
+            }
+        """)
+        button_layout.addWidget(set_m5_pick_btn)
         
         # Center all button
         center_btn = QPushButton("🎯 CENTER ALL")
@@ -5908,6 +6205,44 @@ class ManualMotorControlDialog(QDialog):
         button_layout.addWidget(close_btn)
         
         layout.addLayout(button_layout)
+
+    def save_m5_neutral(self):
+        """Save current wrist_roll as neutral (parallel to ground)."""
+        try:
+            if not getattr(self, "parent_window", None):
+                QMessageBox.warning(self, "Not available", "Parent window not available; can't save calibration.")
+                return
+            if "wrist_roll" not in self.motors:
+                QMessageBox.warning(self, "Not available", "wrist_roll motor not available.")
+                return
+            deg = float(self.bus.read("Present_Position", "wrist_roll", normalize=True))
+            try:
+                self.parent_window._set_wrist_roll_neutral_deg(deg, set_by="manual_control")
+                self.parent_window._append_exec_log("info", f"Saved wrist_roll_neutral_deg={deg:+.1f}° (parallel to ground)")
+            except Exception:
+                pass
+            QMessageBox.information(self, "Saved", f"Saved M5 neutral (wrist_roll_neutral_deg) = {deg:+.1f}°")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to save M5 neutral: {e}")
+
+    def save_m5_pick(self):
+        """Save current wrist_roll as pick roll (used for grasping)."""
+        try:
+            if not getattr(self, "parent_window", None):
+                QMessageBox.warning(self, "Not available", "Parent window not available; can't save calibration.")
+                return
+            if "wrist_roll" not in self.motors:
+                QMessageBox.warning(self, "Not available", "wrist_roll motor not available.")
+                return
+            deg = float(self.bus.read("Present_Position", "wrist_roll", normalize=True))
+            try:
+                self.parent_window._set_wrist_roll_pick_deg(deg, set_by="manual_control")
+                self.parent_window._append_exec_log("info", f"Saved wrist_roll_pick_deg={deg:+.1f}°")
+            except Exception:
+                pass
+            QMessageBox.information(self, "Saved", f"Saved M5 pick roll (wrist_roll_pick_deg) = {deg:+.1f}°")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to save M5 pick roll: {e}")
     
     def create_motor_control(self, motor_name: str, config: dict) -> QGroupBox:
         """Create control group for a single motor."""
