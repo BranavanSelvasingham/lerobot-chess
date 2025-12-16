@@ -18,9 +18,11 @@ def schema() -> dict[str, Any]:
         "name": "move_joints",
         "description": (
             "Directly command joint targets (joint-space control). "
-            "This can be more reliable than IK when the kinematic model is imperfect. "
-            "Provide any subset of joints. Body joints are degrees, gripper is 0..100. "
-            "Use small changes and iterate based on camera feedback."
+            "More reliable than IK for this robot. "
+            "To extend/retract: change shoulder_lift and elbow_flex in OPPOSITE directions (~5° each), adjust wrist_flex to keep gripper down. "
+            "To move left/right: change shoulder_pan alone. "
+            "Body joints are degrees, gripper is 0..100. "
+            "Use small changes and check camera feedback."
         ),
         "strict": False,
         "parameters": {

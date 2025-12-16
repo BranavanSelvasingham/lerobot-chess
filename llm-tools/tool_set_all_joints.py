@@ -24,11 +24,10 @@ def schema() -> dict[str, Any]:
         "type": "function",
         "name": "set_all_joints",
         "description": (
-            "Set absolute targets for ALL motors at once (joint-space control). "
-            "This is the most direct/low-level motion command. "
-            "Body joints are in degrees. Gripper is in 0..100 units (0=closed, 100=open). "
-            "For safety, this tool clamps per-call joint deltas (defaults: 15deg for body joints, 35 units for gripper). "
-            "Returns before/after readback so you can close the loop."
+            "Set absolute targets for ALL 6 motors at once (joint-space control). "
+            "PREFERRED for board movement: copy CURRENT_JOINTS, then change shoulder_lift and elbow_flex in OPPOSITE directions (~5° each) to extend/retract, adjust wrist_flex to keep gripper down. "
+            "Body joints are degrees. Gripper is 0..100 (0=closed, 100=open). "
+            "Safety: clamps per-call deltas (15° body, 35 gripper). Returns before/after for closed-loop control."
         ),
         "strict": False,
         "parameters": {

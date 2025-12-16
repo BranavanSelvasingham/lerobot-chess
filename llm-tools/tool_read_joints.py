@@ -38,16 +38,25 @@ def execute(tools: "KinematicsTools", args: dict[str, Any]) -> dict[str, Any]:
         if include_gripper:
             names.append("gripper")
 
-        try:
-            q = tools._read_joints_deg(names)  # type: ignore[attr-defined]
-            return {
-                "ok": True,
-                "torque_disabled": bool(getattr(tools, "torque_disabled", False)),
-                "joints": q,
-            }
-        except Exception as e:
-            return {
-                "ok": False,
-                "torque_disabled": bool(getattr(tools, "torque_disabled", False)),
-                "error": str(e),
-            }
+        # Robust read: try each joint so one overloaded motor doesn't wipe the whole snapshot.
+        joints: dict[str, float | None] = {n: None for n in names}
+        errors: dict[str, str] = {}
+        for n in names:
+            try:
+                q = tools._read_joints_deg([n])  # type: ignore[attr-defined]
+                if n in q:
+                    joints[n] = float(q[n])
+            except Exception as e:
+                errors[n] = str(e)
+
+        ok = any(v is not None for v in joints.values())
+        out: dict[str, Any] = {
+            "ok": bool(ok),
+            "torque_disabled": bool(getattr(tools, "torque_disabled", False)),
+            "joints": joints,
+        }
+        if errors:
+            out["errors"] = errors
+        if not ok and errors:
+            out["error"] = "Failed to read any joints."
+        return out

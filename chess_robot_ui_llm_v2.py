@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QSplitter,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -99,6 +100,7 @@ class ToolExecutionThread(QThread):
 class LLMThread(QThread):
     log_line = Signal(str)
     finished_ok = Signal(bool)
+    step_update = Signal(int, int)  # (current_step, max_steps)
 
     def __init__(
         self,
@@ -108,6 +110,7 @@ class LLMThread(QThread):
         model: str,
         tools: KinematicsTools,
         command: str,
+        enabled_tool_names: list[str] | None = None,
         max_steps: int = 20,
     ):
         super().__init__()
@@ -117,10 +120,19 @@ class LLMThread(QThread):
         self.tools_impl = tools
         self.command = command
         self.max_steps = int(max_steps)
+        self.enabled_tool_names = enabled_tool_names
 
     def run(self) -> None:
         try:
             tool_schemas = self.tools_impl.tool_schemas()
+            enabled_set: set[str] | None = None
+            if isinstance(self.enabled_tool_names, list):
+                enabled_set = {str(x) for x in self.enabled_tool_names if str(x)}
+                tool_schemas = [
+                    s
+                    for s in tool_schemas
+                    if isinstance(s, dict) and str(s.get("name", "")) in enabled_set
+                ]
             prev_response_id: str | None = None
 
             # Log accumulator for conversation context
@@ -141,6 +153,9 @@ class LLMThread(QThread):
                 joints_payload = joints_now
                 if isinstance(joints_now, dict) and isinstance(joints_now.get("joints"), dict):
                     joints_payload = joints_now["joints"]
+                    # If some joints are unreadable, ensure keys are present (None) so the model still sees all motors.
+                    for k in ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]:
+                        joints_payload.setdefault(k, None)
                 user_content.append(
                     {
                         "type": "input_text",
@@ -195,11 +210,22 @@ class LLMThread(QThread):
             input_items: Any = [{"role": "user", "content": user_content}]
 
             # System instructions mentioning vision capability
+            enabled_line = ""
+            try:
+                if enabled_set is not None:
+                    enabled_line = (
+                        "TOOLS ENABLED THIS RUN: "
+                        + ", ".join(sorted(enabled_set))
+                        + "\n(If a tool is not listed, it is disabled and you cannot call it.)\n\n"
+                    )
+            except Exception:
+                enabled_line = ""
             instructions = (
                 "You control a real SO-101 robot arm for chess piece manipulation. "
                 "You receive camera images showing the current board state after each action.\n\n"
+                + enabled_line
 
-                "AUTONOMOUS EXECUTION POLICY:\n"
+                + "AUTONOMOUS EXECUTION POLICY:\n"
                 "- You have access to all tools the user has access to.\n"
                 "- Do NOT ask the user questions or request extra input; infer reasonable defaults and proceed.\n"
                 "- Use the camera images and tool results to verify progress and adjust.\n"
@@ -245,19 +271,40 @@ class LLMThread(QThread):
                 "- Use CURRENT_JOINTS + images to close the loop when moves are unreliable.\n\n"
 
                 "JOINT CHEAT SHEET (SO-101, APPROXIMATE):\n"
-                "- shoulder_pan: rotates the whole arm left/right (moves camera view sideways).\n"
-                "- shoulder_lift: raises/lowers the upper arm (affects height + reach).\n"
-                "- elbow_flex: bends/extends the elbow (affects reach to/from the board).\n"
-                "- wrist_flex: pitches the wrist (changes camera tilt and gripper approach angle).\n"
-                "- wrist_roll: rolls the gripper about its axis (rotates the tongs in the image).\n"
-                "- gripper: 0=closed, 100=open.\n"
-                "NOTE: The SIGN of each joint may be opposite of your intuition. If unsure, probe with ±2–5° and observe.\n\n"
+                "- shoulder_pan (M1): rotates the whole arm left/right (moves camera view sideways).\n"
+                "- shoulder_lift (M2): raises/lowers the upper arm. More negative = arm reaches further forward.\n"
+                "- elbow_flex (M3): bends/extends the elbow. More negative = elbow straighter = reaches further.\n"
+                "- wrist_flex (M4): pitches the wrist/gripper. Adjust to keep gripper pointing down at board.\n"
+                "- wrist_roll (M5): rolls the gripper about its axis (rotates the tongs in the image).\n"
+                "- gripper (M6): 0=closed, 100=open.\n"
+                "NOTE: Signs may be opposite of intuition. Probe with ±3° and observe image changes.\n\n"
+
+                "JOINT COORDINATION RECIPES (use set_all_joints or move_joints):\n"
+                "To EXTEND reach (move gripper away from robot, toward far side of board):\n"
+                "  - Decrease shoulder_lift (M2) by ~5° (tilts upper arm forward)\n"
+                "  - INCREASE elbow_flex (M3) by ~5° (straightens elbow - OPPOSITE direction from M2!)\n"
+                "  - Adjust wrist_flex (M4) to keep gripper pointing down (probe to find direction)\n"
+                "To RETRACT (move gripper toward robot, toward near side of board):\n"
+                "  - Increase shoulder_lift (M2) by ~5° (tilts upper arm back)\n"
+                "  - DECREASE elbow_flex (M3) by ~5° (bends elbow more - OPPOSITE direction from M2!)\n"
+                "  - Adjust wrist_flex (M4) accordingly\n"
+                "To move DOWN toward board (lower Z):\n"
+                "  - Decrease shoulder_lift (M2) by ~3-5° (lowers arm)\n"
+                "  - Adjust elbow_flex (M3) and wrist_flex (M4) to compensate\n"
+                "To move UP (raise Z):\n"
+                "  - Increase shoulder_lift (M2) by ~3-5° (raises arm)\n"
+                "  - Adjust M3 and M4 to compensate\n"
+                "To move LEFT/RIGHT across board:\n"
+                "  - Change shoulder_pan (M1) alone: probe ±5° to find direction\n"
+                "KEY INSIGHT: M2 and M3 move in OPPOSITE directions for reach changes!\n\n"
 
                 "HOW TO USE set_all_joints EFFECTIVELY:\n"
-                "- Start from CURRENT_JOINTS, copy it, then change ONLY 1–2 joints by a small amount.\n"
+                "- Start from CURRENT_JOINTS, copy all values.\n"
+                "- For reach: change M2 one direction, M3 the OPPOSITE direction, adjust M4 to keep gripper down.\n"
+                "- For sideways: adjust M1 (shoulder_pan) alone.\n"
                 "- Call set_all_joints with all 6 targets. The tool clamps per-call deltas for safety.\n"
-                "- After each call, look at the new image + CURRENT_JOINTS to see what changed.\n"
-                "- Build a mental mapping: which joint moves the piece toward the tong center.\n"
+                "- After each call, check the image + CURRENT_JOINTS to see what changed.\n"
+                "- If a move didn't go the right direction, reverse the signs and retry.\n"
                 "- If you get lost or near limits, call go_home and retry.\n\n"
                 
                 "GRABBING A PIECE:\n"
@@ -287,6 +334,7 @@ class LLMThread(QThread):
             )
 
             for step in range(self.max_steps):
+                self.step_update.emit(step + 1, self.max_steps)
                 # Log what we're about to send (high signal, no giant blobs)
                 in_has_image = False
                 try:
@@ -372,6 +420,8 @@ class LLMThread(QThread):
                     joints_payload = joints_now
                     if isinstance(joints_now, dict) and isinstance(joints_now.get("joints"), dict):
                         joints_payload = joints_now["joints"]
+                        for k in ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]:
+                            joints_payload.setdefault(k, None)
                     joints_text = "CURRENT_JOINTS (degrees; gripper 0..100):\n" + json.dumps(
                         joints_payload, indent=2
                     )
@@ -408,6 +458,44 @@ class LLMThread(QThread):
         except Exception as e:
             self.log_line.emit(json.dumps({"ok": False, "error": str(e)}, indent=2))
             self.finished_ok.emit(False)
+
+
+class CollapsibleSection(QWidget):
+    """Simple collapsible container with an arrow + title header."""
+
+    def __init__(self, title: str, *, expanded: bool = True, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._title = str(title)
+
+        self.toggle_btn = QToolButton(text=self._title)
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setChecked(bool(expanded))
+        self.toggle_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; }")
+        self.toggle_btn.clicked.connect(self._on_toggled)
+
+        self.content = QWidget()
+        self.content.setVisible(bool(expanded))
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        outer.addWidget(self.toggle_btn)
+        outer.addWidget(self.content)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self.content.setVisible(bool(checked))
+        self.toggle_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+    def setContentWidget(self, widget: QWidget) -> None:
+        # Clear existing content
+        for child in list(self.content.children()):
+            if isinstance(child, QWidget):
+                child.setParent(None)
+        lay = QVBoxLayout(self.content)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(widget)
 
 
 class ChessRobotUILLMV2(QMainWindow):
@@ -545,6 +633,17 @@ class ChessRobotUILLMV2(QMainWindow):
         tools_layout.setContentsMargins(10, 10, 10, 10)
         tools_layout.setSpacing(10)
 
+        # Activity status (prominent indicator)
+        activity_row = QHBoxLayout()
+        self.activity_label = QLabel("● IDLE")
+        self.activity_label.setStyleSheet(
+            "QLabel { color: #3fb950; font-weight: bold; font-size: 14px; padding: 4px 10px; "
+            "background-color: #1a3d2a; border-radius: 4px; }"
+        )
+        activity_row.addWidget(self.activity_label)
+        activity_row.addStretch()
+        tools_layout.addLayout(activity_row)
+
         self.status_label = QLabel("Robot: -- | Kinematics: -- | Board: --")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: #c9d1d9;")
@@ -630,8 +729,60 @@ class ChessRobotUILLMV2(QMainWindow):
         llm_row.addWidget(self.llm_run_btn)
         tools_layout.addLayout(llm_row)
 
+        # LLM tool directory (enable/disable tools exposed to the model)
+        tool_dir_body = QGroupBox()
+        tool_dir_layout = QVBoxLayout(tool_dir_body)
+        tool_dir_layout.setContentsMargins(10, 10, 10, 10)
+        tool_dir_layout.setSpacing(6)
+        tool_dir_layout.addWidget(QLabel("Choose which tools the LLM can call for this run:"))
+
+        self.llm_tool_checks: dict[str, QCheckBox] = {}
+        self._llm_tool_names_ordered: list[str] = []
+        try:
+            schemas = self.tools.tool_schemas()
+            seen: set[str] = set()
+            for s in schemas:
+                if not isinstance(s, dict):
+                    continue
+                n = str(s.get("name", "")).strip()
+                if not n or n in seen:
+                    continue
+                seen.add(n)
+                self._llm_tool_names_ordered.append(n)
+        except Exception:
+            self._llm_tool_names_ordered = []
+
+        cols = QHBoxLayout()
+        col_left = QVBoxLayout()
+        col_right = QVBoxLayout()
+        cols.addLayout(col_left, 1)
+        cols.addLayout(col_right, 1)
+
+        for idx, name in enumerate(self._llm_tool_names_ordered):
+            cb = QCheckBox(name)
+            cb.setChecked(True)
+            self.llm_tool_checks[name] = cb
+            (col_left if (idx % 2 == 0) else col_right).addWidget(cb)
+        col_left.addStretch()
+        col_right.addStretch()
+        tool_dir_layout.addLayout(cols)
+
+        btn_row = QHBoxLayout()
+        self.llm_tools_enable_all_btn = QPushButton("Enable all")
+        self.llm_tools_disable_all_btn = QPushButton("Disable all")
+        self.llm_tools_enable_all_btn.clicked.connect(lambda: self._set_llm_tools_enabled(True))
+        self.llm_tools_disable_all_btn.clicked.connect(lambda: self._set_llm_tools_enabled(False))
+        btn_row.addWidget(self.llm_tools_enable_all_btn)
+        btn_row.addWidget(self.llm_tools_disable_all_btn)
+        btn_row.addStretch()
+        tool_dir_layout.addLayout(btn_row)
+
+        self.llm_tool_dir_section = CollapsibleSection("LLM Tool Directory", expanded=False)
+        self.llm_tool_dir_section.setContentWidget(tool_dir_body)
+        tools_layout.addWidget(self.llm_tool_dir_section)
+
         # Manual tool controls
-        manual_group = QGroupBox("Manual Tool Call")
+        manual_group = QGroupBox()
         manual_layout = QVBoxLayout(manual_group)
         manual_layout.setContentsMargins(10, 10, 10, 10)
         manual_layout.setSpacing(8)
@@ -724,7 +875,9 @@ class ChessRobotUILLMV2(QMainWindow):
         self.exec_btn.clicked.connect(self._run_manual_tool)
         manual_layout.addWidget(self.exec_btn)
 
-        tools_layout.addWidget(manual_group)
+        self.manual_section = CollapsibleSection("Manual Tool Call", expanded=True)
+        self.manual_section.setContentWidget(manual_group)
+        tools_layout.addWidget(self.manual_section)
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -915,16 +1068,58 @@ class ChessRobotUILLMV2(QMainWindow):
         self._selected_model = str(model)
         self._log(f"LLM model changed to: {model}")
 
-    def _set_busy(self, busy: bool) -> None:
+    def _set_busy(self, busy: bool, context: str = "") -> None:
+        # Update activity indicator
+        if busy:
+            label = "● BUSY" if not context else f"● BUSY ({context})"
+            self.activity_label.setText(label)
+            self.activity_label.setStyleSheet(
+                "QLabel { color: #d29922; font-weight: bold; font-size: 14px; padding: 4px 10px; "
+                "background-color: #3d3117; border-radius: 4px; }"
+            )
+        else:
+            self.activity_label.setText("● IDLE")
+            self.activity_label.setStyleSheet(
+                "QLabel { color: #3fb950; font-weight: bold; font-size: 14px; padding: 4px 10px; "
+                "background-color: #1a3d2a; border-radius: 4px; }"
+            )
+
         self.exec_btn.setEnabled(not busy)
         self.tool_combo.setEnabled(not busy)
         self.model_combo.setEnabled(not busy)
         self.llm_run_btn.setEnabled((not busy) and (self._llm_client is not None))
         self.llm_input.setEnabled(not busy)
+        # LLM tool directory should not change mid-run.
+        try:
+            for cb in getattr(self, "llm_tool_checks", {}).values():
+                cb.setEnabled(not busy)
+            if hasattr(self, "llm_tools_enable_all_btn"):
+                self.llm_tools_enable_all_btn.setEnabled(not busy)
+            if hasattr(self, "llm_tools_disable_all_btn"):
+                self.llm_tools_disable_all_btn.setEnabled(not busy)
+        except Exception:
+            pass
         # Safety: torque buttons should always be available.
         self.torque_off_btn.setEnabled(True)
         self.torque_on_btn.setEnabled(True)
         self.diag_btn.setEnabled(True)
+
+    def _get_enabled_llm_tools(self) -> set[str]:
+        enabled: set[str] = set()
+        try:
+            for name, cb in getattr(self, "llm_tool_checks", {}).items():
+                if cb.isChecked():
+                    enabled.add(str(name))
+        except Exception:
+            pass
+        return enabled
+
+    def _set_llm_tools_enabled(self, enabled: bool) -> None:
+        try:
+            for cb in getattr(self, "llm_tool_checks", {}).values():
+                cb.setChecked(bool(enabled))
+        except Exception:
+            pass
 
     def _run_manual_tool(self) -> None:
         if self._tool_thread is not None and self._tool_thread.isRunning():
@@ -965,7 +1160,7 @@ class ChessRobotUILLMV2(QMainWindow):
                 "step_mm": float(self.look_step.value()),
             }
 
-        self._set_busy(True)
+        self._set_busy(True, f"Manual: {tool}")
         self._refresh_status()
 
         t = ToolExecutionThread(self.tools, tool, args)
@@ -987,15 +1182,33 @@ class ChessRobotUILLMV2(QMainWindow):
         if not cmd:
             return
 
-        self._set_busy(True)
+        self._set_busy(True, "LLM")
         self._refresh_status()
         self._log(f"LLM command: {cmd}")
 
-        t = LLMThread(ui=self, llm_client=self._llm_client, model=str(self._selected_model), tools=self.tools, command=cmd)
+        enabled = sorted(self._get_enabled_llm_tools())
+        self._log(f"LLM enabled tools: {enabled}")
+        t = LLMThread(
+            ui=self,
+            llm_client=self._llm_client,
+            model=str(self._selected_model),
+            tools=self.tools,
+            command=cmd,
+            enabled_tool_names=enabled,
+        )
         self._llm_thread = t
         t.log_line.connect(self._log)
+        t.step_update.connect(self._on_llm_step)
         t.finished_ok.connect(lambda ok: (self._set_busy(False), self._refresh_status()))
         t.start()
+
+    def _on_llm_step(self, step: int, max_steps: int) -> None:
+        """Update activity label with LLM step progress."""
+        self.activity_label.setText(f"● BUSY (LLM step {step}/{max_steps})")
+        self.activity_label.setStyleSheet(
+            "QLabel { color: #d29922; font-weight: bold; font-size: 14px; padding: 4px 10px; "
+            "background-color: #3d3117; border-radius: 4px; }"
+        )
 
     def closeEvent(self, event) -> None:  # noqa: N802
         try:

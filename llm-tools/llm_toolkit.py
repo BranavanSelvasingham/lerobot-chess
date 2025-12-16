@@ -559,7 +559,11 @@ class KinematicsTools:
         except Exception:
             out: dict[str, float] = {}
             for j in joint_names:
-                out[j] = float(bus.read("Present_Position", j, normalize=True))
+                try:
+                    out[j] = float(bus.read("Present_Position", j, normalize=True))
+                except Exception:
+                    # Leave unread joints out; callers that need strict reads should validate presence.
+                    continue
             return out
 
     def _send_joint_targets_deg(self, targets_deg: dict[str, float]) -> dict[str, Any]:
@@ -572,7 +576,7 @@ class KinematicsTools:
     ) -> dict[str, Any]:
         """Best-effort read of a bus register (sync_read → per-motor read).
 
-        Returns either a mapping motor->value, or {"_error": "..."} on failure.
+        Returns a mapping motor->value. If a motor read fails, its value is {"_error": "..."}.
         """
         robot = self._require_robot()
         bus = robot.bus
@@ -581,13 +585,15 @@ class KinematicsTools:
             vals = bus.sync_read(data_name, names, normalize=normalize)
             return {m: vals[m] for m in names}
         except Exception as e_sync:
-            try:
-                out: dict[str, Any] = {}
-                for m in names:
+            out: dict[str, Any] = {}
+            for m in names:
+                try:
                     out[m] = bus.read(data_name, m, normalize=normalize)
-                return out
-            except Exception as e_read:
-                return {"_error": f"sync_read={type(e_sync).__name__}: {e_sync}; read={type(e_read).__name__}: {e_read}"}
+                except Exception as e_read:
+                    out[m] = {
+                        "_error": f"sync_read={type(e_sync).__name__}: {e_sync}; read={type(e_read).__name__}: {e_read}"
+                    }
+            return out
 
     def _send_gripper_percent(self, percent: float) -> dict[str, Any]:
         """Send gripper command in normalized 0..100 units.
@@ -953,8 +959,20 @@ class KinematicsTools:
             from tool_set_gripper_percent import execute as exec_tool
 
             return exec_tool(self, args)
+        if name == "open_gripper":
+            from tool_open_gripper import execute as exec_tool
+
+            return exec_tool(self, args)
+        if name == "close_gripper":
+            from tool_close_gripper import execute as exec_tool
+
+            return exec_tool(self, args)
         if name == "go_home":
             from tool_go_home import execute as exec_tool
+
+            return exec_tool(self, args)
+        if name == "go_birds_eye":
+            from tool_go_birds_eye import execute as exec_tool
 
             return exec_tool(self, args)
         if name == "move_piece":
@@ -1001,9 +1019,12 @@ class KinematicsTools:
 
     def tool_schemas(self) -> list[dict[str, Any]]:
         from tool_go_home import schema as schema_go_home
+        from tool_go_birds_eye import schema as schema_go_birds_eye
         from tool_move_gripper_delta import schema as schema_move_gripper_delta
         from tool_move_piece import schema as schema_move_piece
         from tool_set_gripper_percent import schema as schema_set_gripper_percent
+        from tool_open_gripper import schema as schema_open_gripper
+        from tool_close_gripper import schema as schema_close_gripper
         from tool_look_around import schema as schema_look_around
         from tool_read_joints import schema as schema_read_joints
         from tool_move_joints import schema as schema_move_joints
@@ -1012,7 +1033,10 @@ class KinematicsTools:
         return [
             schema_move_gripper_delta(),
             schema_set_gripper_percent(),
+            schema_open_gripper(),
+            schema_close_gripper(),
             schema_go_home(),
+            schema_go_birds_eye(),
             schema_move_piece(),
             schema_look_around(),
             schema_read_joints(),
