@@ -85,7 +85,7 @@ def execute(tools: "KinematicsTools", args: dict[str, Any]) -> dict[str, Any]:
 
         # Gripper values on this robot: 0=closed, 100=open
         open_value = 95.0
-        grasp_close = 20.0
+        grasp_close = 0.0  # Fully closed to grip piece
 
         waypoints: list[tuple[np.ndarray, float]] = [
             (src_hover, open_value),
@@ -99,14 +99,30 @@ def execute(tools: "KinematicsTools", args: dict[str, Any]) -> dict[str, Any]:
             (dst_hover, open_value),
         ]
 
-        per_wp_sleep_s = 0.20
         results: list[dict[str, Any]] = []
+        prev_gripper = open_value
+        
         for idx, (xyz, g) in enumerate(waypoints, start=1):
             res = tools._move_ee_to(xyz_m=xyz, R_fixed=R_fixed, gripper_pos=g)
             res["waypoint_index"] = idx
             res["waypoint_gripper"] = float(g)
             results.append(res)
-            time.sleep(per_wp_sleep_s)
+            
+            # For gripper close (grasp), use stall detection
+            if g < prev_gripper and g == grasp_close:
+                # This is a grasp action - wait for stall
+                grip_result = tools.close_gripper_until_stall(target_percent=g, timeout_s=3.0)
+                res["grip_result"] = grip_result
+                res["gripped_object"] = grip_result.get("stalled", False)
+            else:
+                # Regular move - wait for motors to stop
+                stopped = tools.wait_until_motors_stopped(timeout_s=5.0)
+                res["motors_stopped"] = stopped
+            
+            prev_gripper = g
+            
+            # Small extra settle time
+            time.sleep(0.1)
 
         return {
             "ok": True,

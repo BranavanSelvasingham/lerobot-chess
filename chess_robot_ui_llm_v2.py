@@ -222,53 +222,48 @@ class LLMThread(QThread):
                 enabled_line = ""
             instructions = (
                 "You control a real SO-101 robot arm for chess piece manipulation. "
-                "You receive camera images showing the current board state after each action.\n\n"
+                "You receive camera images showing the current state after each action.\n\n"
                 + enabled_line
 
                 + "AUTONOMOUS EXECUTION POLICY:\n"
-                "- You have access to all tools the user has access to.\n"
-                "- Do NOT ask the user questions or request extra input; infer reasonable defaults and proceed.\n"
-                "- Use the camera images and tool results to verify progress and adjust.\n"
-                "- Execute multi-step sequences as needed until the goal is achieved.\n"
-                "- If the goal seems unreachable (e.g., 3 consecutive motion failures / large persistent error / overload), call go_home and retry.\n"
-                "- Only stop early if a safety issue occurs (overload / torque-off / unreachable), then report what happened.\n\n"
+                "- Do NOT ask questions; infer reasonable defaults and proceed.\n"
+                "- Use camera images and tool results to verify progress and adjust.\n"
+                "- Execute multi-step sequences until the goal is achieved.\n"
+                "- If stuck after 3 failures, call go_home and report what happened.\n\n"
 
                 "CAMERA SETUP:\n"
-                "- The camera is mounted ON THE GRIPPER (eye-in-hand configuration)\n"
-                "- The gripper tongs/tips are visible at the bottom of the camera image\n"
-                "- When you see a piece, it is viewed from above through the gripper\n"
-                "- To grab a piece: position it BETWEEN the two gripper tongs in the image\n"
-                "- The piece should appear centered between the tongs before closing\n\n"
+                "- Camera is mounted ON THE GRIPPER (eye-in-hand)\n"
+                "- Gripper tongs are visible at the bottom of the image\n"
+                "- To grab a piece: center it BETWEEN the gripper tongs in the image\n\n"
                 
-                "CHESS BOARD:\n"
-                "- Each square is approximately 1 inch × 1 inch (~25mm × 25mm)\n"
-                "- Squares are labeled a1-h8 (files a-h, ranks 1-8)\n"
-                "- The board calibration may have slight offsets\n\n"
-                
+                "WORKFLOW FOR PICKING UP A PIECE:\n"
+                "1. go_birds_eye - Get overview of the board to locate the piece\n"
+                "2. Identify which square the piece is on from the bird's eye view\n"
+                "3. open_gripper - Ensure gripper is open\n"
+                "4. move_to_square square='XX' height='hover' - Position above the piece\n"
+                "5. CHECK CAMERA: Is the piece centered between gripper tongs?\n"
+                "   - If NOT centered: use nudge_gripper to adjust (left/right/forward/back)\n"
+                "   - Repeat until piece appears centered\n"
+                "6. move_to_square square='XX' height='low' - Lower to grasp height\n"
+                "7. CHECK CAMERA AGAIN: Verify piece is still centered\n"
+                "8. close_gripper - Grasp the piece (will stop when it grips something)\n"
+                "9. move_to_square square='YY' height='hover' - Move to destination\n"
+                "10. move_to_square square='YY' height='low' - Lower to place\n"
+                "11. open_gripper - Release the piece\n\n"
+
                 "AVAILABLE TOOLS:\n"
-                "1. go_home: Returns robot to saved home position. Use to reset or start fresh.\n"
-                "2. move_gripper_delta: Move end-effector by delta amounts:\n"
-                "   - dx_mm: radial delta (+ = away from base, - = toward base)\n"
-                "   - dy_mm: tangential delta (left/right arc)\n"
-                "   - dz_mm: vertical delta (+ = up, - = down)\n"
-                "   - Typical moves: 10-50mm. Max ±200mm.\n"
-                "3. move_piece: Pick piece from one square, place on another:\n"
-                "   - from_square, to_square: e.g., 'e2', 'e4'\n"
-                "   - Executes full pick-and-place sequence with hover waypoints\n"
-                "4. set_gripper_percent: Control gripper opening:\n"
-                "   - IMPORTANT: On this robot, 0 = fully CLOSED, 100 = fully OPEN\n"
-                "   - Use ~90-100 for open, ~10-30 for gripping pieces\n\n"
-                "5. look_around: Move the gripper-mounted camera one step to search (left/right/up/down).\n"
-                "   - Call repeatedly one step at a time and stop once the target is in view.\n\n"
-                "6. move_joints: Direct joint-space control (degrees for body joints, 0..100 for gripper).\n"
-                "7. read_joints: Read current joints (degrees + gripper 0..100).\n"
-                "8. set_all_joints: Set ALL motor targets at once (absolute pose in joint space).\n"
-                "9. read_motor_diagnostics: Read motor load/current/temp/voltage/status.\n"
-                "10. disable_torque / enable_torque: Emergency stop and recovery.\n\n"
+                "- go_birds_eye: Move to bird's eye view to see the FULL BOARD. Use this FIRST to locate pieces.\n"
+                "- move_to_square: Position gripper above a square. height='hover' (~80mm above) or 'low' (grasp height)\n"
+                "- nudge_gripper: Fine adjustment (left/right/forward/back/up/down, distance_mm). Use to center piece in view.\n"
+                "- open_gripper: Open gripper to release a piece.\n"
+                "- close_gripper: Close gripper until it grips something (stall detection).\n"
+                "- move_piece: Full pick-and-place in one step (use only if confident in calibration).\n"
+                "- go_home: Return to rest position.\n\n"
                 
-                "STATE FEEDBACK:\n"
-                "- Every message includes CURRENT_JOINTS with all motor positions.\n"
-                "- Use CURRENT_JOINTS + images to close the loop when moves are unreliable.\n\n"
+                "IMPORTANT:\n"
+                "- ALWAYS use go_birds_eye FIRST to see where pieces are on the board.\n"
+                "- ALWAYS verify piece is centered between gripper tongs before closing.\n"
+                "- If piece is not centered, use nudge_gripper to adjust.\n\n"
 
                 "JOINT CHEAT SHEET (SO-101, APPROXIMATE):\n"
                 "- shoulder_pan (M1): rotates the whole arm left/right (moves camera view sideways).\n"
@@ -670,6 +665,18 @@ class ChessRobotUILLMV2(QMainWindow):
         self.diag_btn = QPushButton("Read Motor Diagnostics")
         self.diag_btn.clicked.connect(self._read_motor_diagnostics)
         torque_row.addWidget(self.diag_btn)
+        
+        # Speed control
+        torque_row.addWidget(QLabel("Speed:"))
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setRange(100, 2000)
+        self.speed_spin.setValue(500)
+        self.speed_spin.setSingleStep(100)
+        self.speed_spin.setDecimals(0)
+        self.speed_spin.setToolTip("Motor speed (100=slow, 2000=fast)")
+        self.speed_spin.valueChanged.connect(self._set_speed)
+        torque_row.addWidget(self.speed_spin)
+        
         torque_row.addStretch()
         tools_layout.addLayout(torque_row)
 
@@ -790,7 +797,8 @@ class ChessRobotUILLMV2(QMainWindow):
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel("Tool:"))
         self.tool_combo = QComboBox()
-        self.tool_combo.addItems(["move_gripper_delta", "set_gripper_percent", "go_home", "move_piece", "look_around"])
+        # Essential chess tools only
+        self.tool_combo.addItems(["go_birds_eye", "go_home", "open_gripper", "close_gripper", "move_piece"])
         self.tool_combo.currentTextChanged.connect(self._sync_tool_fields)
         top_row.addWidget(self.tool_combo, 1)
         manual_layout.addLayout(top_row)
@@ -798,52 +806,37 @@ class ChessRobotUILLMV2(QMainWindow):
         self.tool_fields = QStackedWidget()
         manual_layout.addWidget(self.tool_fields)
 
-        # Fields: move_gripper_delta (polar interface)
-        w_move = QWidget()
-        wml = QVBoxLayout(w_move)
-        wml.setContentsMargins(0, 0, 0, 0)
-        wml.setSpacing(4)
+        # Fields: go_birds_eye (no args)
+        w_birds = QWidget()
+        wbl = QHBoxLayout(w_birds)
+        wbl.setContentsMargins(0, 0, 0, 0)
+        wbl.addWidget(QLabel("Move to bird's eye view to observe board"))
+        wbl.addStretch()
+        self.tool_fields.addWidget(w_birds)
 
-        # Row 1: radial and angular
-        row1 = QHBoxLayout()
-        self.dx_spin = QDoubleSpinBox(); self.dx_spin.setRange(-200.0, 200.0); self.dx_spin.setDecimals(1); self.dx_spin.setValue(10.0)
-        self.dtheta_spin = QDoubleSpinBox(); self.dtheta_spin.setRange(-180.0, 180.0); self.dtheta_spin.setDecimals(1); self.dtheta_spin.setValue(0.0)
-        self.dy_spin = QDoubleSpinBox(); self.dy_spin.setRange(-200.0, 200.0); self.dy_spin.setDecimals(1); self.dy_spin.setValue(0.0)
-        row1.addWidget(QLabel("Δradius(mm)")); row1.addWidget(self.dx_spin)
-        row1.addWidget(QLabel("Δθ(deg)")); row1.addWidget(self.dtheta_spin)
-        row1.addWidget(QLabel("dy(mm)")); row1.addWidget(self.dy_spin)
-        wml.addLayout(row1)
-
-        # Row 2: height controls
-        row2 = QHBoxLayout()
-        self.dz_spin = QDoubleSpinBox(); self.dz_spin.setRange(-200.0, 200.0); self.dz_spin.setDecimals(1); self.dz_spin.setValue(0.0)
-        self.z_abs_spin = QDoubleSpinBox(); self.z_abs_spin.setRange(0.0, 0.6); self.z_abs_spin.setDecimals(3); self.z_abs_spin.setValue(0.0); self.z_abs_spin.setSingleStep(0.01)
-        self.z_abs_check = QCheckBox("use abs Z")
-        self.z_abs_check.setChecked(False)
-        row2.addWidget(QLabel("Δz(mm)")); row2.addWidget(self.dz_spin)
-        row2.addWidget(self.z_abs_check)
-        row2.addWidget(QLabel("Z(m)")); row2.addWidget(self.z_abs_spin)
-        wml.addLayout(row2)
-
-        # Note: Large moves are automatically broken into 15mm incremental steps
-        self.tool_fields.addWidget(w_move)
-
-        # Fields: set_gripper_percent
-        w_grip = QWidget()
-        wgl = QHBoxLayout(w_grip)
-        wgl.setContentsMargins(0, 0, 0, 0)
-        self.grip_spin = QDoubleSpinBox(); self.grip_spin.setRange(0.0, 100.0); self.grip_spin.setDecimals(1); self.grip_spin.setValue(15.0)
-        wgl.addWidget(QLabel("percent")); wgl.addWidget(self.grip_spin)
-        wgl.addStretch()
-        self.tool_fields.addWidget(w_grip)
-
-        # Fields: go_home
+        # Fields: go_home (no args)
         w_home = QWidget()
         whl = QHBoxLayout(w_home)
         whl.setContentsMargins(0, 0, 0, 0)
-        whl.addWidget(QLabel("No args"))
+        whl.addWidget(QLabel("Return to rest position"))
         whl.addStretch()
         self.tool_fields.addWidget(w_home)
+
+        # Fields: open_gripper (no args)
+        w_open = QWidget()
+        wol = QHBoxLayout(w_open)
+        wol.setContentsMargins(0, 0, 0, 0)
+        wol.addWidget(QLabel("Open gripper to release piece"))
+        wol.addStretch()
+        self.tool_fields.addWidget(w_open)
+
+        # Fields: close_gripper (no args)
+        w_close = QWidget()
+        wcl = QHBoxLayout(w_close)
+        wcl.setContentsMargins(0, 0, 0, 0)
+        wcl.addWidget(QLabel("Close gripper to grasp piece"))
+        wcl.addStretch()
+        self.tool_fields.addWidget(w_close)
 
         # Fields: move_piece
         w_piece = QWidget()
@@ -858,18 +851,6 @@ class ChessRobotUILLMV2(QMainWindow):
         wpl.addWidget(QLabel("hover(m)")); wpl.addWidget(self.hover_spin)
         wpl.addWidget(QLabel("transit(m)")); wpl.addWidget(self.transit_spin)
         self.tool_fields.addWidget(w_piece)
-
-        # Fields: look_around
-        w_look = QWidget()
-        wll = QHBoxLayout(w_look)
-        wll.setContentsMargins(0, 0, 0, 0)
-        self.look_dir = QComboBox()
-        self.look_dir.addItems(["left", "right", "up", "down"])
-        self.look_step = QDoubleSpinBox(); self.look_step.setRange(1.0, 200.0); self.look_step.setDecimals(1); self.look_step.setSingleStep(5.0); self.look_step.setValue(25.0)
-        wll.addWidget(QLabel("direction")); wll.addWidget(self.look_dir)
-        wll.addWidget(QLabel("step(mm)")); wll.addWidget(self.look_step)
-        wll.addStretch()
-        self.tool_fields.addWidget(w_look)
 
         self.exec_btn = QPushButton("Execute")
         self.exec_btn.clicked.connect(self._run_manual_tool)
@@ -1006,7 +987,7 @@ class ChessRobotUILLMV2(QMainWindow):
 
     def _sync_tool_fields(self, tool_name: str) -> None:
         name = str(tool_name)
-        idx = {"move_gripper_delta": 0, "set_gripper_percent": 1, "go_home": 2, "move_piece": 3, "look_around": 4}.get(name, 0)
+        idx = {"go_birds_eye": 0, "go_home": 1, "open_gripper": 2, "close_gripper": 3, "move_piece": 4}.get(name, 0)
         self.tool_fields.setCurrentIndex(int(idx))
 
     # -----------------------------
@@ -1131,21 +1112,13 @@ class ChessRobotUILLMV2(QMainWindow):
         tool = str(self.tool_combo.currentText())
         args: dict[str, Any] = {}
 
-        if tool == "move_gripper_delta":
-            args = {
-                "dx_mm": float(self.dx_spin.value()),
-                "dy_mm": float(self.dy_spin.value()),
-                "dz_mm": float(self.dz_spin.value()),
-            }
-            # Add optional dtheta_deg if non-zero
-            if abs(float(self.dtheta_spin.value())) > 0.01:
-                args["dtheta_deg"] = float(self.dtheta_spin.value())
-            # Add absolute Z if checkbox is checked
-            if self.z_abs_check.isChecked():
-                args["z_m"] = float(self.z_abs_spin.value())
-        elif tool == "set_gripper_percent":
-            args = {"percent": float(self.grip_spin.value())}
+        if tool == "go_birds_eye":
+            args = {}
         elif tool == "go_home":
+            args = {}
+        elif tool == "open_gripper":
+            args = {}
+        elif tool == "close_gripper":
             args = {}
         elif tool == "move_piece":
             args = {
@@ -1153,11 +1126,6 @@ class ChessRobotUILLMV2(QMainWindow):
                 "to_square": str(self.to_sq.text()).strip(),
                 "hover_height_m": float(self.hover_spin.value()),
                 "transit_height_m": float(self.transit_spin.value()),
-            }
-        elif tool == "look_around":
-            args = {
-                "direction": str(self.look_dir.currentText()),
-                "step_mm": float(self.look_step.value()),
             }
 
         self._set_busy(True, f"Manual: {tool}")
@@ -1254,6 +1222,13 @@ class ChessRobotUILLMV2(QMainWindow):
             self._log(json.dumps(diag, indent=2))
         except Exception as e:
             self._log(f"Diagnostics failed: {e}")
+
+    def _set_speed(self, value: float) -> None:
+        try:
+            self.tools.set_motor_speed(int(value))
+            self._log(f"Motor speed set to {int(value)}")
+        except Exception as e:
+            self._log(f"Set speed failed: {e}")
 
 
 def _parse_args() -> AppConfig:

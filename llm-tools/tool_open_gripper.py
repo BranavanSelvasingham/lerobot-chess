@@ -28,4 +28,6 @@ def execute(tools: "KinematicsTools", args: dict[str, Any]) -> dict[str, Any]:
     with tools._lock:
         # 95% open (leaving small margin)
         tools._send_joint_targets_deg({"gripper": 95.0})
-        return {"ok": True, "gripper_percent": 95.0, "action": "opened"}
+        # Wait for gripper to finish moving
+        stopped = tools.wait_until_motors_stopped(timeout_s=3.0)
+        return {"ok": True, "gripper_percent": 95.0, "action": "opened", "motors_stopped": stopped}

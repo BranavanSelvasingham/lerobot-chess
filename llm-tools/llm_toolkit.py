@@ -222,6 +222,132 @@ class KinematicsTools:
             self._load_board_view_calibration()
             self._load_workspace_bounds()
             self.torque_disabled = False
+            
+            # Set a reasonable default speed (not max)
+            self.set_motor_speed(500)
+    
+    def set_motor_speed(self, speed: int = 500) -> None:
+        """Set motor movement speed for all motors.
+        
+        Args:
+            speed: Speed value (0-4095). Lower = slower. 
+                   Recommended: 200-800 for smooth moves, 0 = max speed.
+        """
+        if self.robot is None or not self.robot.is_connected:
+            return
+        try:
+            # Goal_Velocity controls servo speed (0 = max, higher = slower but capped)
+            # For STS3215: speed is in steps/sec, ~0-4095 range
+            speed = max(0, min(4095, int(speed)))
+            self.robot.bus.sync_write("Goal_Velocity", speed, normalize=False)
+        except Exception as e:
+            print(f"Warning: Could not set motor speed: {e}")
+    
+    def close_gripper_until_stall(self, target_percent: float = 0.0, timeout_s: float = 3.0) -> dict:
+        """Close gripper until it stalls (grips object) or reaches target.
+        
+        Returns dict with final position and whether stall was detected.
+        """
+        if self.robot is None or not self.robot.is_connected:
+            return {"ok": False, "error": "Robot not connected"}
+        
+        import time
+        
+        # Send close command
+        self._send_joint_targets_deg({"gripper": target_percent})
+        
+        start = time.time()
+        last_pos = None
+        stall_count = 0
+        stall_threshold = 3  # Number of consecutive same-position reads to detect stall
+        
+        while (time.time() - start) < timeout_s:
+            try:
+                # Read current gripper position
+                obs = self.robot.get_observation()
+                current_pos = obs.get("gripper.pos", 0)
+                
+                # Check if gripper has stopped moving (stalled on object)
+                if last_pos is not None:
+                    if abs(current_pos - last_pos) < 0.5:  # Less than 0.5 degree change
+                        stall_count += 1
+                        if stall_count >= stall_threshold:
+                            # Gripper has stalled - gripping something
+                            return {
+                                "ok": True,
+                                "stalled": True,
+                                "final_position": float(current_pos),
+                                "target_position": float(target_percent),
+                            }
+                    else:
+                        stall_count = 0
+                
+                # Check if reached target
+                if abs(current_pos - target_percent) < 2.0:
+                    return {
+                        "ok": True,
+                        "stalled": False,
+                        "final_position": float(current_pos),
+                        "target_position": float(target_percent),
+                    }
+                
+                last_pos = current_pos
+                
+            except Exception as e:
+                pass
+            
+            time.sleep(0.05)
+        
+        # Timeout - return current state
+        try:
+            obs = self.robot.get_observation()
+            final = obs.get("gripper.pos", 0)
+        except:
+            final = 0
+            
+        return {
+            "ok": True,
+            "stalled": True,  # Assume stalled on timeout
+            "final_position": float(final),
+            "target_position": float(target_percent),
+            "timeout": True,
+        }
+
+    def wait_until_motors_stopped(self, timeout_s: float = 5.0, poll_interval_s: float = 0.05) -> bool:
+        """Wait until all motors have stopped moving.
+        
+        Args:
+            timeout_s: Maximum time to wait (seconds)
+            poll_interval_s: How often to check (seconds)
+            
+        Returns:
+            True if motors stopped, False if timeout
+        """
+        if self.robot is None or not self.robot.is_connected:
+            return True
+        
+        import time
+        start = time.time()
+        motors = list(self.robot.bus.motors.keys())
+        
+        while (time.time() - start) < timeout_s:
+            try:
+                # Read Moving register for all motors
+                moving_status = self.robot.bus.sync_read("Moving", motors, normalize=False)
+                
+                # Check if any motor is still moving (Moving=1 means moving)
+                any_moving = any(v != 0 for v in moving_status.values())
+                
+                if not any_moving:
+                    return True
+                    
+            except Exception:
+                # If read fails, fall back to small delay
+                pass
+            
+            time.sleep(poll_interval_s)
+        
+        return False  # Timeout
 
     def disconnect_robot(self) -> None:
         with self._lock:
@@ -979,6 +1105,14 @@ class KinematicsTools:
             from tool_move_piece import execute as exec_tool
 
             return exec_tool(self, args)
+        if name == "move_to_square":
+            from tool_move_to_square import execute as exec_tool
+
+            return exec_tool(self, args)
+        if name == "nudge_gripper":
+            from tool_nudge_gripper import execute as exec_tool
+
+            return exec_tool(self, args)
         if name == "look_around":
             from tool_look_around import execute as exec_tool
 
@@ -1020,63 +1154,19 @@ class KinematicsTools:
     def tool_schemas(self) -> list[dict[str, Any]]:
         from tool_go_home import schema as schema_go_home
         from tool_go_birds_eye import schema as schema_go_birds_eye
-        from tool_move_gripper_delta import schema as schema_move_gripper_delta
         from tool_move_piece import schema as schema_move_piece
-        from tool_set_gripper_percent import schema as schema_set_gripper_percent
+        from tool_move_to_square import schema as schema_move_to_square
+        from tool_nudge_gripper import schema as schema_nudge_gripper
         from tool_open_gripper import schema as schema_open_gripper
         from tool_close_gripper import schema as schema_close_gripper
-        from tool_look_around import schema as schema_look_around
-        from tool_read_joints import schema as schema_read_joints
-        from tool_move_joints import schema as schema_move_joints
-        from tool_set_all_joints import schema as schema_set_all_joints
 
+        # Chess tools - includes fine control for visual alignment
         return [
-            schema_move_gripper_delta(),
-            schema_set_gripper_percent(),
-            schema_open_gripper(),
-            schema_close_gripper(),
-            schema_go_home(),
-            schema_go_birds_eye(),
-            schema_move_piece(),
-            schema_look_around(),
-            schema_read_joints(),
-            schema_move_joints(),
-            schema_set_all_joints(),
-            # Lightweight schemas for torque + diagnostics (no separate files needed)
-            {
-                "type": "function",
-                "name": "read_motor_diagnostics",
-                "description": "Read motor diagnostics registers (current/load/temp/voltage/status).",
-                "strict": False,
-                "parameters": {
-                    "type": "object",
-                    "properties": {"motors": {"type": "array", "items": {"type": "string"}}},
-                    "required": [],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "disable_torque",
-                "description": "Disable torque on motors (E-stop).",
-                "strict": False,
-                "parameters": {
-                    "type": "object",
-                    "properties": {"motors": {"type": "array", "items": {"type": "string"}}},
-                    "required": [],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "enable_torque",
-                "description": "Re-enable torque on motors after an E-stop.",
-                "strict": False,
-                "parameters": {
-                    "type": "object",
-                    "properties": {"motors": {"type": "array", "items": {"type": "string"}}},
-                    "required": [],
-                    "additionalProperties": False,
-                },
-            },
+            schema_go_birds_eye(),   # Observe full board
+            schema_go_home(),        # Rest position
+            schema_move_to_square(), # Position above a square
+            schema_nudge_gripper(),  # Fine adjustment for alignment
+            schema_open_gripper(),   # Release piece
+            schema_close_gripper(),  # Grasp piece
+            schema_move_piece(),     # Full pick and place (when alignment not needed)
         ]

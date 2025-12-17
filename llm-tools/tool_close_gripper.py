@@ -26,6 +26,12 @@ def schema() -> dict[str, Any]:
 def execute(tools: "KinematicsTools", args: dict[str, Any]) -> dict[str, Any]:
     _ = args
     with tools._lock:
-        # Close enough to grip a piece but not fully closed
-        tools._send_joint_targets_deg({"gripper": 20.0})
-        return {"ok": True, "gripper_percent": 20.0, "action": "closed"}
+        # Close gripper until it stalls on object or reaches target
+        result = tools.close_gripper_until_stall(target_percent=0.0, timeout_s=3.0)
+        return {
+            "ok": result.get("ok", False),
+            "action": "closed",
+            "gripped_object": result.get("stalled", False),
+            "final_position": result.get("final_position", 0),
+            **result
+        }
